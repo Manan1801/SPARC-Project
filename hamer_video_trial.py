@@ -10,17 +10,13 @@ from pathlib import Path
 #####################################################################
 # 1) Paths to HaMeR repo and checkpoint
 #####################################################################
-# We assume your HaMeR repo is at: /home/hpm_mv_2/Desktop/hamer
 HAMER_REPO_PATH = "/home/hpm_mv_2/Desktop/hamer"
-# This is the default checkpoint we want to load:
-#   /home/hpm_mv_2/Desktop/hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt
 DEFAULT_CKPT_PATH = "/home/hpm_mv_2/Desktop/hamer/_DATA/hamer_ckpts/checkpoints/hamer.ckpt"
 
-# We'll add the HaMeR repo path to sys.path so "import hamer" works
 sys.path.append(HAMER_REPO_PATH)
 
 #####################################################################
-# 2) Attempt to import from HaMeR
+# 2) Import HaMeR modules
 #####################################################################
 try:
     from hamer.configs import CACHE_DIR_HAMER
@@ -30,24 +26,19 @@ try:
     from hamer.utils import recursive_to
     from hamer.utils.utils_detectron2 import DefaultPredictor_Lazy
 except ImportError as e:
-    print("ERROR: Could not import the 'hamer' package from:")
-    print(f"  {HAMER_REPO_PATH}")
-    print("Make sure your HaMeR repo structure is correct and that you have an __init__.py in the hamer/ folder.")
+    print("ERROR: Could not import 'hamer' from:", HAMER_REPO_PATH)
     raise e
 
 #####################################################################
-# 3) Attempt to import the vitpose_model
+# 3) Import vitpose_model
 #####################################################################
 try:
     from vitpose_model import ViTPoseModel
 except ImportError as e:
-    print("ERROR: Could not import 'vitpose_model.py'. Place vitpose_model.py either in the HaMeR repo or same folder.")
+    print("ERROR: Could not import 'vitpose_model.py'.")
     raise e
 
-# A color for the hand meshes
 LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
-
-# Hardcoded fallback for input video. If empty, we'll prompt the user or rely on --video_in
 HARDCODED_VIDEO = "/home/hpm_mv_2/Desktop/camera1.avi"
 
 
@@ -63,16 +54,16 @@ def process_frame(
     conf_threshold=0.5
 ):
     """
-    Detects persons, extracts hand bounding boxes, runs HaMeR to get 3D hand meshes,
-    and returns two frames:
+    Detect persons, extract hand bounding boxes, run HaMeR to get 3D hand meshes.
+    Returns:
       1) overlay_frame_bgr: Original + mesh overlay
-      2) mesh_frame_bgr: Mesh-only on a black background
+      2) mesh_frame_bgr: Mesh-only on black
     """
-    frame_rgb = frame_bgr[:,:,::-1].copy()
+    # 1) DETECT PERSONS
+    frame_rgb = frame_bgr[:, :, ::-1].copy()  # BGR->RGB
     det_out = detector(frame_bgr)
     det_instances = det_out['instances']
 
-    # Keep only class==0 (person) above threshold
     valid_idx = (det_instances.pred_classes == 0) & (det_instances.scores > conf_threshold)
     pred_bboxes = det_instances.pred_boxes.tensor[valid_idx].cpu().numpy()
     pred_scores = det_instances.scores[valid_idx].cpu().numpy()
@@ -80,59 +71,90 @@ def process_frame(
     if len(pred_bboxes) == 0:
         return frame_bgr, np.zeros_like(frame_bgr)
 
+    # 2) RUN VITPOSE KEYPOINT DETECTION
     det_input = [np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1)]
     vitposes_out = cpm.predict_pose(frame_rgb, det_input)
 
+    # 3) EXTRACT HAND BBOXES
     bboxes = []
     is_right = []
     for vitposes in vitposes_out:
-        # Last 42 = left(21) + right(21) hand keypoints
-        left_hand_keyp  = vitposes['keypoints'][-42:-21]
-        right_hand_keyp = vitposes['keypoints'][-21:]
+        left_hand_keyp  = vitposes['keypoints'][-42:-21]  # 21 left
+        right_hand_keyp = vitposes['keypoints'][-21:]     # 21 right
 
-        valid_mask_left = left_hand_keyp[:,2] > 0.5
-        if valid_mask_left.sum() > 3:
-            x_min, y_min = left_hand_keyp[valid_mask_left,0].min(), left_hand_keyp[valid_mask_left,1].min()
-            x_max, y_max = left_hand_keyp[valid_mask_left,0].max(), left_hand_keyp[valid_mask_left,1].max()
-            bboxes.append([x_min,y_min,x_max,y_max])
+        valid_l = left_hand_keyp[:, 2] > 0.5
+        if valid_l.sum() > 3:
+            x_min, y_min = left_hand_keyp[valid_l, 0].min(), left_hand_keyp[valid_l, 1].min()
+            x_max, y_max = left_hand_keyp[valid_l, 0].max(), left_hand_keyp[valid_l, 1].max()
+            bboxes.append([x_min, y_min, x_max, y_max])
             is_right.append(0)
 
-        valid_mask_right = right_hand_keyp[:,2] > 0.5
-        if valid_mask_right.sum() > 3:
-            x_min, y_min = right_hand_keyp[valid_mask_right,0].min(), right_hand_keyp[valid_mask_right,1].min()
-            x_max, y_max = right_hand_keyp[valid_mask_right,0].max(), right_hand_keyp[valid_mask_right,1].max()
-            bboxes.append([x_min,y_min,x_max,y_max])
+        valid_r = right_hand_keyp[:, 2] > 0.5
+        if valid_r.sum() > 3:
+            x_min, y_min = right_hand_keyp[valid_r, 0].min(), right_hand_keyp[valid_r, 1].min()
+            x_max, y_max = right_hand_keyp[valid_r, 0].max(), right_hand_keyp[valid_r, 1].max()
+            bboxes.append([x_min, y_min, x_max, y_max])
             is_right.append(1)
 
     if len(bboxes) == 0:
         return frame_bgr, np.zeros_like(frame_bgr)
 
+    # 4) CREATE DATASET FOR HAMER
     boxes = np.array(bboxes)
     right_array = np.array(is_right)
-
     dataset = ViTDetDataset(model_cfg, frame_bgr, boxes, right_array, rescale_factor=rescale_factor)
+
     all_verts = []
     all_camt  = []
     all_right = []
 
     for i in range(len(dataset)):
-        sample = dataset[i]
-        # Turn each sample item into shape [1, ...] if it's a tensor
+        sample = dataset[i]  # dict with keys: 'img', 'box_center', 'box_size', 'img_size', 'right', 'personid'
+
+        # Convert 'img' from np.ndarray to torch.Tensor, shape [3,H,W]
+        if isinstance(sample['img'], np.ndarray):
+            arr = sample['img']
+            if arr.ndim == 3 and arr.shape[-1] == 3:
+                # (H, W, 3) -> (3, H, W)
+                arr = np.transpose(arr, (2, 0, 1))
+            sample['img'] = torch.from_numpy(arr).float()
+
+        # Now unsqueeze to get shape [1, 3, H, W]
+        if sample['img'].ndim == 3:
+            sample['img'] = sample['img'].unsqueeze(0)
+
+        # Convert 'img_size' to 2D if needed
+        # If 'img_size' is shape (2,) => make it (1,2)
+        if isinstance(sample['img_size'], np.ndarray):
+            sample['img_size'] = torch.from_numpy(sample['img_size']).float()
+        if sample['img_size'].ndim == 1:
+            sample['img_size'] = sample['img_size'].unsqueeze(0)
+
+        # The same for other numeric/tensor keys
         for key in sample:
-            if hasattr(sample[key], 'unsqueeze'):
+            if key not in ('img', 'img_size') and hasattr(sample[key], 'unsqueeze'):
                 sample[key] = sample[key].unsqueeze(0)
 
+        # Move everything to device
         sample = recursive_to(sample, device)
+
+        # 5) HAMER FORWARD
         with torch.no_grad():
             out = hamer_model(sample)
 
+        # Flip horizontal camera offset if right hand
         pred_cam = out['pred_cam'].clone()
         multiplier = (2 * sample['right'] - 1)
-        pred_cam[:,1] *= multiplier
+        pred_cam[:, 1] *= multiplier
 
         scaled_focal_length = (
-            model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * sample['img_size'].max().item()
+            model_cfg.EXTRA.FOCAL_LENGTH
+            / model_cfg.MODEL.IMAGE_SIZE
+            * sample['img_size'].max().item()
         )
+
+        # 6) Re-map local crop coords to full image
+        #    => shape (1,2) means we can do index [:,0], [:,1]
         pred_cam_t_full = cam_crop_to_full(
             pred_cam,
             sample["box_center"],
@@ -143,30 +165,38 @@ def process_frame(
 
         pred_vertices = out['pred_vertices'][0].cpu().numpy()
         is_right_hand = sample['right'].cpu().numpy()[0]
-        pred_vertices[:,0] = (2*is_right_hand - 1)*pred_vertices[:,0]
+        # Flip X coords for right hand
+        pred_vertices[:, 0] = (2 * is_right_hand - 1) * pred_vertices[:, 0]
 
         all_verts.append(pred_vertices)
         all_camt.append(pred_cam_t_full)
         all_right.append(is_right_hand)
 
+    # 7) RENDER THE FULL-FRAME OVERLAY
     h, w, _ = frame_bgr.shape
     cam_view = renderer.render_rgba_multiple(
-        all_verts, cam_t=all_camt, render_res=[h,w], is_right=all_right,
-        mesh_base_color=LIGHT_BLUE, scene_bg_color=(1,1,1), focal_length=scaled_focal_length
+        all_verts, cam_t=all_camt, render_res=[h, w],
+        is_right=all_right,
+        mesh_base_color=LIGHT_BLUE,
+        scene_bg_color=(1,1,1),
+        focal_length=scaled_focal_length
     )
+
+    # Original frame -> RGBA
     frame_rgba = np.concatenate([
-        frame_bgr[:,:,::-1].astype(np.float32)/255.0,
-        np.ones((h,w,1), dtype=np.float32)
+        frame_bgr[:, :, ::-1].astype(np.float32) / 255.0,
+        np.ones((h, w, 1), dtype=np.float32)
     ], axis=2)
 
-    alpha_mesh = cam_view[:,:,3:]
-    mesh_rgb   = cam_view[:,:,:3]
+    alpha_mesh = cam_view[:, :, 3:]
+    mesh_rgb   = cam_view[:, :, :3]
 
-    overlay_rgb = frame_rgba[:,:,:3]*(1 - alpha_mesh) + mesh_rgb*alpha_mesh
-    overlay_bgr = (overlay_rgb[:,:,::-1]*255).astype(np.uint8)
+    overlay_rgb = frame_rgba[:, :, :3] * (1 - alpha_mesh) + mesh_rgb * alpha_mesh
+    overlay_bgr = (overlay_rgb[:, :, ::-1] * 255).astype(np.uint8)
 
-    mesh_only_rgb = mesh_rgb*alpha_mesh
-    mesh_only_bgr = (mesh_only_rgb[:,:,::-1]*255).astype(np.uint8)
+    # Mesh-only on black
+    mesh_only_rgb = mesh_rgb * alpha_mesh
+    mesh_only_bgr = (mesh_only_rgb[:, :, ::-1] * 255).astype(np.uint8)
 
     return overlay_bgr, mesh_only_bgr
 
@@ -176,7 +206,7 @@ def main():
     parser.add_argument('--video_in', type=str, default=None,
                         help='Path to input video. If not provided, fallback or prompt is used.')
     parser.add_argument('--checkpoint', type=str, default=DEFAULT_CKPT_PATH,
-                        help='Path to HaMeR checkpoint in /home/hpm_mv_2/Desktop/hamer/_DATA/...')
+                        help='Path to HaMeR checkpoint in /home/hpm_mv_2/Desktop/hamer/_DATA/... .ckpt file')
     parser.add_argument('--body_detector', type=str, default='vitdet',
                         help='Choose "vitdet" or "regnety" as the body detector.')
     parser.add_argument('--conf_threshold', type=float, default=0.5,
@@ -185,41 +215,39 @@ def main():
                         help='Factor for bounding box expansion.')
     args, unknown = parser.parse_known_args()
 
-    # 1) Figure out which video to use
+    # 1) Which video?
     if args.video_in and args.video_in.strip():
         input_video_path = args.video_in.strip()
     elif HARDCODED_VIDEO.strip():
         input_video_path = HARDCODED_VIDEO
         print(f"[INFO] Using HARDCODED_VIDEO: {input_video_path}")
     else:
-        # Prompt
         input_video_path = input("Please specify input video path: ").strip()
         if not input_video_path:
             print("[ERROR] No video path given. Exiting.")
             return
 
-    # 2) Check checkpoint path
+    # 2) Check checkpoint
     ckpt_path = Path(args.checkpoint)
     if not ckpt_path.is_file():
         print(f"[ERROR] The checkpoint file does not exist:\n  {ckpt_path}")
-        print("Please fix the path, or place hamer.ckpt where expected.")
         sys.exit(1)
 
-    # 3) Initialize device
+    # 3) Select device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    # 4) Download models if needed, then load the HaMeR model
+    # 4) Download + load HaMeR
     download_models(CACHE_DIR_HAMER)
     print(f"[INFO] Loading HaMeR checkpoint from: {ckpt_path}")
     hamer_model, model_cfg = load_hamer(str(ckpt_path))
-    hamer_model = hamer_model.to(device)
+    hamer_model.to(device)
     hamer_model.eval()
 
-    # 5) Set up body detector
+    # 5) Body detector
     if args.body_detector == 'vitdet':
         from detectron2.config import LazyConfig
         import hamer
-        cfg_file = Path(hamer.__file__).parent/'configs'/'cascade_mask_rcnn_vitdet_h_75ep.py'
+        cfg_file = Path(hamer.__file__).parent / 'configs' / 'cascade_mask_rcnn_vitdet_h_75ep.py'
         detectron2_cfg = LazyConfig.load(str(cfg_file))
         detectron2_cfg.train.init_checkpoint = (
             "https://dl.fbaipublicfiles.com/detectron2/ViTDet/COCO/"
@@ -235,13 +263,13 @@ def main():
         detectron2_cfg.model.roi_heads.box_predictor.test_nms_thresh   = 0.4
         detector = DefaultPredictor_Lazy(detectron2_cfg)
 
-    # 6) Load ViTPose
+    # 6) ViTPose
     cpm = ViTPoseModel(device)
 
-    # 7) Create the renderer
+    # 7) Renderer
     renderer = Renderer(model_cfg, faces=hamer_model.mano.faces)
 
-    # 8) Read the video
+    # 8) Read video
     cap = cv2.VideoCapture(str(input_video_path))
     if not cap.isOpened():
         print(f"[ERROR] Could not open video: {input_video_path}")
