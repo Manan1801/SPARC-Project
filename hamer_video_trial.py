@@ -40,6 +40,7 @@ except ImportError as e:
 LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
 HARDCODED_VIDEO = "/home/hpm_mv_2/Desktop/camera1.avi"
 
+
 def process_frame(
     frame_bgr: np.ndarray,
     detector: DefaultPredictor_Lazy,
@@ -52,12 +53,12 @@ def process_frame(
     conf_threshold=0.5
 ):
     """
-    Detect persons, extract bounding boxes for hands, run HaMeR for 3D mesh,
-    then return:
-      1) overlay_frame_bgr: Original frame + mesh overlay
-      2) mesh_frame_bgr: Mesh-only on black background
+    1) Detect persons (Detectron2),
+    2) Extract bounding boxes for hands (ViTPose),
+    3) Run HaMeR for 3D mesh,
+    4) Return overlay + mesh-only frames.
     """
-    # 1) Detect persons with Detectron2
+    # 1) DETECT PERSON
     frame_rgb = frame_bgr[:, :, ::-1].copy()
     det_out = detector(frame_bgr)
     det_instances = det_out['instances']
@@ -69,16 +70,16 @@ def process_frame(
     if len(pred_bboxes) == 0:
         return frame_bgr, np.zeros_like(frame_bgr)
 
-    # 2) Run ViTPose keypoint detection
+    # 2) KEYPOINTS (ViTPose)
     det_input = [np.concatenate([pred_bboxes, pred_scores[:, None]], axis=1)]
     vitposes_out = cpm.predict_pose(frame_rgb, det_input)
 
-    # 3) Extract bounding boxes for left & right hands
+    # 3) EXTRACT HAND BBOXES
     bboxes = []
     is_right = []
     for vitposes in vitposes_out:
-        left_hand_keyp  = vitposes['keypoints'][-42:-21]  # 21 left
-        right_hand_keyp = vitposes['keypoints'][-21:]     # 21 right
+        left_hand_keyp  = vitposes['keypoints'][-42:-21]
+        right_hand_keyp = vitposes['keypoints'][-21:]
 
         valid_l = left_hand_keyp[:,2] > 0.5
         if valid_l.sum() > 3:
@@ -97,7 +98,7 @@ def process_frame(
     if len(bboxes) == 0:
         return frame_bgr, np.zeros_like(frame_bgr)
 
-    # 4) Prepare dataset for HaMeR
+    # 4) MAKE DATASET FOR HaMeR
     boxes = np.array(bboxes)
     right_array = np.array(is_right)
     dataset = ViTDetDataset(model_cfg, frame_bgr, boxes, right_array, rescale_factor=rescale_factor)
@@ -107,50 +108,58 @@ def process_frame(
     all_right = []
 
     for i in range(len(dataset)):
-        sample = dataset[i]  # dict with 'img', 'box_center', 'box_size', 'img_size', 'right', 'personid'
+        sample = dataset[i]
 
-        # Convert sample['img'] if it's np.ndarray => torch tensor, shape [3,H,W]
+        # Convert sample['img'] => torch tensor [3,H,W]
         if isinstance(sample['img'], np.ndarray):
             arr = sample['img']
             if arr.ndim == 3 and arr.shape[-1] == 3:
-                # (H,W,3)->(3,H,W)
-                arr = np.transpose(arr, (2,0,1))
+                arr = np.transpose(arr, (2,0,1))  # (H,W,3)->(3,H,W)
             sample['img'] = torch.from_numpy(arr).float()
-
-        # Now add batch dim => [1,3,H,W]
         if sample['img'].ndim == 3:
-            sample['img'] = sample['img'].unsqueeze(0)
+            sample['img'] = sample['img'].unsqueeze(0)  # => [1,3,H,W]
 
-        # For box_center => ensure shape is [B,2]
+        # box_center => shape [B,2]
         if isinstance(sample["box_center"], np.ndarray):
             sample["box_center"] = torch.from_numpy(sample["box_center"]).float()
         if sample["box_center"].ndim == 1:
             sample["box_center"] = sample["box_center"].unsqueeze(0)
 
-        # For box_size => typically 1D is okay, but convert to torch if needed
+        # box_size => typically shape (1,) or scalar is okay
         if isinstance(sample["box_size"], np.ndarray):
             sample["box_size"] = torch.from_numpy(sample["box_size"]).float()
-        # We'll let box_size remain shape [1] or shape [] if it is a single number
 
-        # For img_size => ensure shape is [B,2]
+        # img_size => shape [B,2]
         if isinstance(sample["img_size"], np.ndarray):
             sample["img_size"] = torch.from_numpy(sample["img_size"]).float()
         if sample["img_size"].ndim == 1:
             sample["img_size"] = sample["img_size"].unsqueeze(0)
 
+        # Now fix sample['right'] => ensure it's a 1D torch tensor
+        if isinstance(sample['right'], (np.float32, float, int)):
+            # e.g. 0 or 1 or np.float32(0)
+            sample['right'] = torch.tensor([sample['right']]).float()
+        elif isinstance(sample['right'], np.ndarray):
+            sample['right'] = torch.from_numpy(sample['right']).float()
+
+        # If it's a 0D or shape [1], we do not necessarily need unsqueeze,
+        # but let's keep it consistent => shape [1].
+        if sample['right'].ndim == 0:
+            sample['right'] = sample['right'].unsqueeze(0)
+
         # For other keys that might be Tensors
         for key in sample:
-            if key not in ('img','box_center','box_size','img_size') and hasattr(sample[key], 'unsqueeze'):
-                sample[key] = sample[key].unsqueeze(0)
+            if key not in ('img', 'box_center', 'box_size', 'img_size', 'right'):
+                if hasattr(sample[key], 'unsqueeze'):
+                    sample[key] = sample[key].unsqueeze(0)
 
-        # Move everything to device
         sample = recursive_to(sample, device)
 
-        # 5) Inference with HaMeR
+        # 5) RUN HaMeR
         with torch.no_grad():
             out = hamer_model(sample)
 
-        # Flip horizontal camera param for right hands
+        # Flip horizontal camera offset for right hand
         pred_cam = out['pred_cam'].clone()
         multiplier = (2 * sample['right'] - 1)
         pred_cam[:,1] *= multiplier
@@ -172,6 +181,7 @@ def process_frame(
 
         pred_vertices = out['pred_vertices'][0].cpu().numpy()
         is_right_hand = sample['right'].cpu().numpy()[0]
+
         # Flip X coords if right hand
         pred_vertices[:,0] = (2*is_right_hand -1)*pred_vertices[:,0]
 
@@ -179,7 +189,7 @@ def process_frame(
         all_camt.append(pred_cam_t_full)
         all_right.append(is_right_hand)
 
-    # 6) Render full-frame overlay
+    # 6) RENDER FULL-FRAME
     h, w, _ = frame_bgr.shape
     cam_view = renderer.render_rgba_multiple(
         all_verts, cam_t=all_camt, render_res=[h, w],
@@ -189,21 +199,19 @@ def process_frame(
         focal_length=scaled_focal_length
     )
 
-    # Original -> RGBA
     frame_rgba = np.concatenate([
-        frame_bgr[:, :, ::-1].astype(np.float32)/255.0,
-        np.ones((h, w, 1), dtype=np.float32)
+        frame_bgr[:,:,::-1].astype(np.float32)/255.0,
+        np.ones((h,w,1), dtype=np.float32)
     ], axis=2)
 
-    alpha_mesh = cam_view[:, :, 3:]
-    mesh_rgb   = cam_view[:, :, :3]
+    alpha_mesh = cam_view[:,:,3:]
+    mesh_rgb   = cam_view[:,:,:3]
 
-    overlay_rgb = frame_rgba[:, :, :3]*(1 - alpha_mesh) + mesh_rgb*alpha_mesh
-    overlay_bgr = (overlay_rgb[:, :, ::-1]*255).astype(np.uint8)
+    overlay_rgb = frame_rgba[:,:,:3]*(1 - alpha_mesh) + mesh_rgb*alpha_mesh
+    overlay_bgr = (overlay_rgb[:,:,::-1]*255).astype(np.uint8)
 
-    # Mesh-only on black
-    mesh_only_rgb = mesh_rgb * alpha_mesh
-    mesh_only_bgr = (mesh_only_rgb[:, :, ::-1]*255).astype(np.uint8)
+    mesh_only_rgb = mesh_rgb*alpha_mesh
+    mesh_only_bgr = (mesh_only_rgb[:,:,::-1]*255).astype(np.uint8)
 
     return overlay_bgr, mesh_only_bgr
 
@@ -240,7 +248,7 @@ def main():
         print(f"[ERROR] The checkpoint file does not exist:\n  {ckpt_path}")
         sys.exit(1)
 
-    # 3) Select device
+    # 3) Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # 4) Download + load HaMeR
@@ -276,7 +284,7 @@ def main():
     # 7) Renderer
     renderer = Renderer(model_cfg, faces=hamer_model.mano.faces)
 
-    # 8) Open the video
+    # 8) Read video
     cap = cv2.VideoCapture(str(input_video_path))
     if not cap.isOpened():
         print(f"[ERROR] Could not open video: {input_video_path}")
