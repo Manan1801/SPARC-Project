@@ -12,8 +12,7 @@ class RealSenseCapture:
         self.config = rs.config()
         self.bag_file = bag_file
 
-        # Internal flag to track pause state, since the RealSense Python API 
-        # doesn't provide an is_paused() method:
+        # Internal flag to track pause state
         self._paused = False
 
         if bag_file:
@@ -44,52 +43,53 @@ class RealSenseCapture:
             except Exception as e:
                 print("Warning: could not set up playback device:", e)
 
+        # Keep track of the last valid frames, so we can keep displaying them if paused
+        self.last_color_image = None
+        self.last_depth_image = None
+        self.last_depth_colormap = None
+
     def pause_playback(self):
-        """
-        Pauses .bag playback if available 
-        and sets our internal paused flag to True.
-        """
+        """Pauses .bag playback if available, and marks our internal flag."""
         if self.playback:
             self.playback.pause()
-            self._paused = True
-            print("Playback paused.")
+        self._paused = True
+        print("Playback paused.")
 
     def resume_playback(self):
-        """
-        Resumes .bag playback if available 
-        and sets our internal paused flag to False.
-        """
+        """Resumes .bag playback if available, and clears our internal flag."""
         if self.playback:
             self.playback.resume()
-            self._paused = False
-            print("Playback resumed.")
+        self._paused = False
+        print("Playback resumed.")
 
     def is_paused(self):
-        """
-        Returns True if we have manually paused the .bag playback.
-        (We track this ourselves, since there's no is_paused() in pyrealsense2.)
-        """
+        """Returns our local paused state."""
         return self._paused
 
     def get_frames(self):
         """
-        Yields (color_image, depth_image, depth_colormap).
-        Handles timeouts gracefully if playback is paused or we hit the end of file.
+        Yields (color_image, depth_image, depth_colormap) continually:
+          - If paused, yields the last known frames so we don't freeze the GUI.
+          - Otherwise, pulls new frames from RealSense.
         """
         try:
             while True:
-                # If paused, skip frame retrieval to prevent timeouts
                 if self.is_paused():
-                    time.sleep(0.1)
+                    # If paused, yield the last frames so main loop can still run cv2.waitKey
+                    if self.last_color_image is not None:
+                        yield self.last_color_image, self.last_depth_image, self.last_depth_colormap
+                    # Prevent tight-loop CPU hogging
+                    time.sleep(0.01)
                     continue
 
+                # Attempt to grab frames
                 frames = None
                 try:
-                    frames = self.pipeline.wait_for_frames(5000)  # 5 second timeout
+                    frames = self.pipeline.wait_for_frames(5000)  # 5-second timeout
                 except RuntimeError as e:
                     err_str = str(e)
-                    # Common RealSense timeout error if no frames arrive
                     if "Frame didn't arrive within" in err_str:
+                        # Possibly end of file or a stall
                         print("[INFO] Timed out waiting for frames; retrying...")
                         time.sleep(0.1)
                         continue
@@ -117,6 +117,11 @@ class RealSenseCapture:
                 # Create a colorized depth frame
                 depth_8bit = cv2.convertScaleAbs(depth_image, alpha=0.05)
                 depth_colormap = cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
+
+                # Update last valid frames
+                self.last_color_image = color_image
+                self.last_depth_image = depth_image
+                self.last_depth_colormap = depth_colormap
 
                 yield color_image, depth_image, depth_colormap
 
