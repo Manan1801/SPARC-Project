@@ -12,6 +12,10 @@ class RealSenseCapture:
         self.config = rs.config()
         self.bag_file = bag_file
 
+        # Internal flag to track pause state, since the RealSense Python API 
+        # doesn't provide an is_paused() method:
+        self._paused = False
+
         if bag_file:
             print(f"Reading from file: {bag_file}")
             self.config.enable_device_from_file(bag_file, repeat_playback=False)
@@ -41,22 +45,31 @@ class RealSenseCapture:
                 print("Warning: could not set up playback device:", e)
 
     def pause_playback(self):
-        """Pauses .bag playback if available."""
+        """
+        Pauses .bag playback if available 
+        and sets our internal paused flag to True.
+        """
         if self.playback:
             self.playback.pause()
+            self._paused = True
             print("Playback paused.")
 
     def resume_playback(self):
-        """Resumes .bag playback if available."""
+        """
+        Resumes .bag playback if available 
+        and sets our internal paused flag to False.
+        """
         if self.playback:
             self.playback.resume()
+            self._paused = False
             print("Playback resumed.")
 
     def is_paused(self):
-        """Returns True if the .bag playback is paused."""
-        if self.playback:
-            return self.playback.is_paused()
-        return False
+        """
+        Returns True if we have manually paused the .bag playback.
+        (We track this ourselves, since there's no is_paused() in pyrealsense2.)
+        """
+        return self._paused
 
     def get_frames(self):
         """
@@ -65,23 +78,19 @@ class RealSenseCapture:
         """
         try:
             while True:
-                # If paused, skip frame retrieval to prevent timeouts.
-                # Sleep briefly to avoid busy-waiting.
+                # If paused, skip frame retrieval to prevent timeouts
                 if self.is_paused():
                     time.sleep(0.1)
                     continue
 
-                # Attempt to grab frames
                 frames = None
                 try:
                     frames = self.pipeline.wait_for_frames(5000)  # 5 second timeout
                 except RuntimeError as e:
                     err_str = str(e)
-                    # Check for the known RealSense timeout message
+                    # Common RealSense timeout error if no frames arrive
                     if "Frame didn't arrive within" in err_str:
-                        # We either reached end of file or there's a stall
                         print("[INFO] Timed out waiting for frames; retrying...")
-                        # Sleep a bit and retry
                         time.sleep(0.1)
                         continue
                     else:
@@ -102,7 +111,7 @@ class RealSenseCapture:
                 depth_image = np.asanyarray(depth_frame.get_data())
                 color_image = np.asanyarray(color_frame.get_data())
 
-                # Convert from RGB -> BGR if needed
+                # Convert from RGB -> BGR if your .bag was recorded in RGB8
                 color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
 
                 # Create a colorized depth frame
