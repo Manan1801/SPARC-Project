@@ -11,8 +11,7 @@ class RealSenseCapture:
         self.config = rs.config()
 
         if bag_file:
-            # Reading from a .bag file; no need to enable specific streams
-            # because the .bag metadata already defines them
+            # Reading from a .bag file
             print(f"Reading from file: {bag_file}")
             self.config.enable_device_from_file(bag_file, repeat_playback=False)
         else:
@@ -33,7 +32,10 @@ class RealSenseCapture:
 
     def get_frames(self):
         """
-        Yields (color_frame, depth_frame) as NumPy arrays on each iteration.
+        Yields (color_image, depth_image, depth_colormap) on each iteration.
+         - color_image: BGR image for OpenCV
+         - depth_image: raw depth in 16-bit
+         - depth_colormap: 8-bit color-mapped visualization of depth
         """
         try:
             while True:
@@ -49,11 +51,17 @@ class RealSenseCapture:
                 depth_image = np.asanyarray(depth_frame.get_data())
                 color_image = np.asanyarray(color_frame.get_data())
 
-                # If your .bag is recorded in RGB8 (not BGR8), 
-                # convert from RGB to BGR for proper OpenCV visualization:
-                # color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
+                # 1) Fix color tint if your .bag is recorded in RGB8
+                #    Comment out if your .bag is actually BGR8
+                color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
 
-                yield (color_image, depth_image)
+                # 2) Convert depth to 8-bit and apply a colormap for better visualization
+                depth_8bit = cv2.convertScaleAbs(depth_image, alpha=0.05)
+                depth_colormap = cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
+
+                # Yield both raw color/depth and the colormap
+                yield color_image, depth_image, depth_colormap
+
         except Exception as e:
             print(f"[ERROR] {e}")
         finally:
@@ -61,10 +69,9 @@ class RealSenseCapture:
 
 def main():
     """
-    Example usage:
-      python realsense_capture.py path/to/file.bag
-    or:
-      python realsense_capture.py  (for live camera)
+    Usage:
+      python realsense_capture.py path/to/file.bag  (for .bag playback)
+      python realsense_capture.py                   (for live camera)
     """
     bag_file = None
     if len(sys.argv) > 1:
@@ -72,10 +79,13 @@ def main():
 
     capture = RealSenseCapture(bag_file=bag_file)
 
-    # For demonstration: display frames in real-time
-    for color_frame, depth_frame in capture.get_frames():
-        cv2.imshow("Color", color_frame)
-        cv2.imshow("Depth", depth_frame)
+    # Demonstration: display color and depth frames in real-time
+    for color_image, depth_raw, depth_vis in capture.get_frames():
+        # Show BGR color image
+        cv2.imshow("Color", color_image)
+
+        # Show color-mapped depth visualization
+        cv2.imshow("Depth", depth_vis)
 
         # Press 'ESC' to stop
         if cv2.waitKey(1) & 0xFF == 27:
