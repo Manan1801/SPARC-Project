@@ -9,6 +9,7 @@ class RealSenseCapture:
     def __init__(self, bag_file=None, width=640, height=480, fps=30):
         self.pipeline = rs.pipeline()
         self.config = rs.config()
+        self.bag_file = bag_file
 
         if bag_file:
             # Reading from a .bag file
@@ -19,23 +20,46 @@ class RealSenseCapture:
             self.config.enable_stream(rs.stream.depth, width, height, rs.format.z16, fps)
             self.config.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
 
-        # Start the pipeline
+        # Start pipeline
         self.profile = self.pipeline.start(self.config)
 
         # Align depth to color
         self.align = rs.align(rs.stream.color)
 
-        # Get depth scale (to convert raw depth to meters, if needed)
+        # Get depth scale
         depth_sensor = self.profile.get_device().first_depth_sensor()
         self.depth_scale = depth_sensor.get_depth_scale()
         print(f"Depth scale: {self.depth_scale}")
 
+        # For .bag playback, we can access the playback device to control pause/resume
+        self.playback = None
+        if self.bag_file:
+            dev = self.profile.get_device()
+            # Attempt to cast the device to a playback object for pause/resume
+            try:
+                self.playback = dev.as_playback()
+                print("Playback device ready for pause/resume control.")
+            except Exception as e:
+                print("Warning: could not set up playback device:", e)
+
+    def pause_playback(self):
+        """Pauses the .bag playback if available."""
+        if self.playback:
+            self.playback.pause()
+            print("Playback paused.")
+
+    def resume_playback(self):
+        """Resumes the .bag playback if available."""
+        if self.playback:
+            self.playback.resume()
+            print("Playback resumed.")
+
     def get_frames(self):
         """
-        Yields (color_image, depth_image, depth_colormap) on each iteration.
-         - color_image: BGR image for OpenCV
-         - depth_image: raw depth in 16-bit
-         - depth_colormap: 8-bit color-mapped visualization of depth
+        Yields (color_image, depth_image, depth_colormap) for each frame:
+          - color_image: BGR image for OpenCV
+          - depth_image: 16-bit raw depth
+          - depth_colormap: 8-bit color-mapped depth for visualization
         """
         try:
             while True:
@@ -47,19 +71,18 @@ class RealSenseCapture:
                 if not depth_frame or not color_frame:
                     continue
 
-                # Convert frames to NumPy
+                # Convert frames to NumPy arrays
                 depth_image = np.asanyarray(depth_frame.get_data())
                 color_image = np.asanyarray(color_frame.get_data())
 
-                # 1) Fix color tint if your .bag is recorded in RGB8
-                #    Comment out if your .bag is actually BGR8
+                # If your .bag was recorded in RGB8, convert from RGB -> BGR
+                # Comment out this line if the .bag or live stream is already BGR8
                 color_image = cv2.cvtColor(color_image, cv2.COLOR_RGB2BGR)
 
-                # 2) Convert depth to 8-bit and apply a colormap for better visualization
+                # Create an 8-bit color map of the depth image for better visualization
                 depth_8bit = cv2.convertScaleAbs(depth_image, alpha=0.05)
                 depth_colormap = cv2.applyColorMap(depth_8bit, cv2.COLORMAP_JET)
 
-                # Yield both raw color/depth and the colormap
                 yield color_image, depth_image, depth_colormap
 
         except Exception as e:
@@ -70,26 +93,31 @@ class RealSenseCapture:
 def main():
     """
     Usage:
-      python realsense_capture.py path/to/file.bag  (for .bag playback)
-      python realsense_capture.py                   (for live camera)
+      python realsense_capture.py path/to/file.bag  (pause/resume is available)
+      python realsense_capture.py                   (live camera, no pausing)
     """
     bag_file = None
     if len(sys.argv) > 1:
         bag_file = sys.argv[1]
 
     capture = RealSenseCapture(bag_file=bag_file)
+    paused = False
 
-    # Demonstration: display color and depth frames in real-time
-    for color_image, depth_raw, depth_vis in capture.get_frames():
-        # Show BGR color image
-        cv2.imshow("Color", color_image)
+    for color_img, depth_img, depth_map in capture.get_frames():
+        cv2.imshow("Color", color_img)
+        cv2.imshow("Depth", depth_map)
 
-        # Show color-mapped depth visualization
-        cv2.imshow("Depth", depth_vis)
-
-        # Press 'ESC' to stop
-        if cv2.waitKey(1) & 0xFF == 27:
+        key = cv2.waitKey(1) & 0xFF
+        # 'ESC' to quit
+        if key == 27:  # ord('\x1b')
             break
+        # 'p' to toggle pause/resume
+        elif key == ord('p'):
+            paused = not paused
+            if paused:
+                capture.pause_playback()
+            else:
+                capture.resume_playback()
 
     cv2.destroyAllWindows()
 
