@@ -1,65 +1,118 @@
 #!/usr/bin/env python3
 
-import torch
-import numpy as np
+import sys
 import cv2
+import numpy as np
+import torch
+
+# Force torch.load to unpickle everything (weights_only=False)
+old_torch_load = torch.load
+def custom_torch_load(f, map_location=None, pickle_module=None, **kwargs):
+    kwargs["weights_only"] = False
+    return old_torch_load(f, map_location=map_location, pickle_module=pickle_module, **kwargs)
+torch.load = custom_torch_load
+
+from mmpose.apis import init_pose_model as init_pose_estimator, inference_top_down_pose_model
+
+def build_sapiens_model(config_path, checkpoint_path, device='cuda'):
+    model = init_pose_estimator(config_path, 
+                                checkpoint_path,
+                                device=device
+                                # override_ckpt_meta=True,  # If needed for new MMPose
+
+                                # If you want to pass something else, keep cfg_options if needed:
+                                # cfg_options=dict(model=dict(test_cfg=dict(output_heatmaps=True)))
+                                )   
+    model.eval()
+
+    cfg = model.cfg
+
+    # If older code references cfg.data_cfg
+    if not hasattr(cfg, 'data_cfg'):
+        cfg.data_cfg = dict(
+            image_size=[256, 256],  # adjust for your model
+            num_joints=21,         # if your model is a 21-joint hand model
+        )
+        print("[WARN] Created fallback cfg.data_cfg with image_size=[256,256], num_joints=21")
+
+    # If older code references cfg.test_pipeline
+    if not hasattr(cfg, 'test_pipeline'):
+        # Try copying from data.test.pipeline if it exists
+        if hasattr(cfg, 'data') and hasattr(cfg.data, 'test') and hasattr(cfg.data.test, 'pipeline'):
+            cfg.test_pipeline = cfg.data.test.pipeline
+            print("[INFO] Copied pipeline from cfg.data.test.pipeline")
+        else:
+            # Minimal fallback
+            cfg.test_pipeline = [
+                dict(type='LoadImageFromFile'),
+                dict(type='TopDownAffine'),
+                dict(type='ToTensor'),
+            ]
+            print("[WARN] Using minimal fallback pipeline for older MMPose code.")
+
+    return model
 
 class Sapiens2DKeypoint:
-    def __init__(self, model_path="path/to/sapiens_weights.pth", device="cuda"):
-        # Pseudocode placeholder for loading a Sapiens model
+    def __init__(
+        self,
+        pose_config="/home/hpm_mv_2/Desktop/SPARC-Project/sapiens/pose/configs/sapiens_pose/coco_wholebody/sapiens_1b-210e_coco_wholebody-1024x768.py",
+        pose_checkpoint="/home/hpm_mv_2/Desktop/sapiens_1b_coco_wholebody_best_coco_wholebody_AP_727.pth",
+        device="cuda",
+    ):
         self.device = device if torch.cuda.is_available() else "cpu"
-        self.model = self.load_sapiens_model(model_path)
-        self.model.eval()
+        self.model = build_sapiens_model(
+            config_path=pose_config,
+            checkpoint_path=pose_checkpoint,
+            device=self.device,
+        )
 
-    def load_sapiens_model(self, path):
-        # This is pseudocode. Adjust to match Sapiens' actual load procedure
-        model = torch.load(path, map_location=self.device)
-        return model
+    def infer_keypoints(self, color_image, bboxes=None):
+        h, w = color_image.shape[:2]
+        if bboxes is None or len(bboxes) == 0:
+            bboxes = [np.array([0, 0, w, h], dtype=np.float32)]
+        elif isinstance(bboxes, np.ndarray):
+            bboxes = [bbox for bbox in bboxes]
 
-    def infer_keypoints(self, color_image):
-        """
-        Args:
-            color_image (np.array): BGR or RGB image from RealSense
-        Returns:
-            keypoints (dict): or np.array of shape (num_keypoints, 2)
-        """
-        # Preprocess
-        inp = self.preprocess(color_image)
-        with torch.no_grad():
-            # Pseudocode for forward pass:
-            output = self.model(inp.to(self.device))
-        # Post-process
-        keypoints = self.postprocess(output, color_image.shape)
-        return keypoints
+        # Convert to person_results
+        person_results = []
+        for box in bboxes:
+            person_results.append({'bbox': box})
 
-    def preprocess(self, img):
-        # E.g. transform to tensor, normalize, resize
-        tensor = torch.as_tensor(img.transpose(2, 0, 1), dtype=torch.float32)
-        # Normalize, etc...
-        tensor = tensor.unsqueeze(0)  # add batch dimension
-        return tensor
+        # Convert color_image from BGR to RGB
+        rgb_img = cv2.cvtColor(color_image, cv2.COLOR_BGR2RGB)
 
-    def postprocess(self, output, img_shape):
-        # Convert model outputs to (x,y) coordinates
-        # This depends on how Sapiens outputs keypoints
-        # Suppose we get Nx2 array for N keypoints
-        keypoints = np.random.rand(21, 2) * np.array([[img_shape[1], img_shape[0]]])
-        # ^ placeholder, replace with real postprocessing
-        return keypoints
+        results, _ = inference_top_down_pose_model(
+            self.model,
+            rgb_img,
+            person_results
+        )
+        # returns a list of PoseDataSample
+        return results
 
-def main_demo():
-    # Demo usage
-    test_image = np.zeros((480, 640, 3), dtype=np.uint8)
+def main():
+    if len(sys.argv) > 1:
+        image_path = sys.argv[1]
+        test_image = cv2.imread(image_path)
+        if test_image is None:
+            print(f"[ERROR] Could not read image: {image_path}")
+            return
+    else:
+        test_image = np.zeros((480, 640, 3), dtype=np.uint8)
+
     keypoint_detector = Sapiens2DKeypoint()
-    kps = keypoint_detector.infer_keypoints(test_image)
-    print("Detected Keypoints:", kps)
+    pose_results = keypoint_detector.infer_keypoints(test_image)
 
-    # Visualize on the image
-    for x, y in kps:
-        cv2.circle(test_image, (int(x), int(y)), 3, (0, 255, 0), -1)
-    cv2.imshow("Keypoints Demo", test_image)
+    for data_sample in pose_results:
+        if not hasattr(data_sample, 'pred_instances'):
+            continue
+        keypoints = data_sample.pred_instances.keypoints
+        for kpt in keypoints:
+            x, y = int(kpt[0]), int(kpt[1])
+            cv2.circle(test_image, (x, y), 3, (0,255,0), -1)
+
+    cv2.imshow("Sapiens Keypoints Demo", test_image)
     cv2.waitKey(0)
     cv2.destroyAllWindows()
 
-if __name__ == "__main__":
-    main_demo()
+if __name__=="__main__":
+    main()

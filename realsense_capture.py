@@ -17,6 +17,7 @@ class RealSenseCapture:
 
         if bag_file:
             print(f"Reading from file: {bag_file}")
+            # We'll load the .bag file without repeating
             self.config.enable_device_from_file(bag_file, repeat_playback=False)
         else:
             # Live camera usage
@@ -40,6 +41,8 @@ class RealSenseCapture:
             try:
                 self.playback = dev.as_playback()
                 print("Playback device ready for pause/resume control.")
+                # --- Enable real-time playback so frames come at recorded speed ---
+                self.playback.set_real_time(True)
             except Exception as e:
                 print("Warning: could not set up playback device:", e)
 
@@ -68,9 +71,9 @@ class RealSenseCapture:
 
     def get_frames(self):
         """
-        Yields (color_image, depth_image, depth_colormap) continually:
-          - If paused, yields the last known frames so we don't freeze the GUI.
-          - Otherwise, pulls new frames from RealSense.
+        Yields (color_image, depth_image, depth_colormap) in real-time:
+          - If paused, yields the last frames so main loop can still run cv2.waitKey.
+          - Otherwise, pulls new frames from RealSense at the recorded rate.
         """
         try:
             while True:
@@ -78,26 +81,18 @@ class RealSenseCapture:
                     # If paused, yield the last frames so main loop can still run cv2.waitKey
                     if self.last_color_image is not None:
                         yield self.last_color_image, self.last_depth_image, self.last_depth_colormap
-                    # Prevent tight-loop CPU hogging
                     time.sleep(0.01)
                     continue
 
-                # Attempt to grab frames
-                frames = None
+                # Attempt to grab frames with no specific timeout,
+                # letting RealSense deliver them at recorded speed
                 try:
-                    frames = self.pipeline.wait_for_frames(5000)  # 5-second timeout
+                    frames = self.pipeline.wait_for_frames()
                 except RuntimeError as e:
-                    err_str = str(e)
-                    if "Frame didn't arrive within" in err_str:
-                        # Possibly end of file or a stall
-                        print("[INFO] Timed out waiting for frames; retrying...")
-                        time.sleep(0.1)
-                        continue
-                    else:
-                        print(f"[ERROR] Unexpected error: {e}")
-                        break
+                    print(f"[ERROR] Could not retrieve frames: {e}")
+                    break
 
-                if not frames:
+                if not frames or frames.size() == 0:
                     print("[INFO] No more frames arrived. Possibly end of file.")
                     break
 
@@ -106,6 +101,7 @@ class RealSenseCapture:
                 color_frame = aligned_frames.get_color_frame()
 
                 if not depth_frame or not color_frame:
+                    # Possibly near end-of-file or a bad frame
                     continue
 
                 depth_image = np.asanyarray(depth_frame.get_data())
@@ -133,6 +129,9 @@ def main():
     Usage:
       python realsense_capture.py path/to/file.bag  (pause/resume with 'p')
       python realsense_capture.py                   (live camera, no pause)
+
+    This version ensures real-time playback for .bag files
+    so frames come at the recorded speed rather than as fast as possible.
     """
     bag_file = None
     if len(sys.argv) > 1:
@@ -142,6 +141,7 @@ def main():
     paused = False
 
     for color_img, depth_raw, depth_map in capture.get_frames():
+        # Show color + depth side by side
         cv2.imshow("Color", color_img)
         cv2.imshow("Depth", depth_map)
 
