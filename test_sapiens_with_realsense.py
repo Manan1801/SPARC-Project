@@ -30,7 +30,7 @@ def main():
     #    Must match your new constructor: 
     #    __init__(pose_config, pose_checkpoint, device="cuda")
     keypoint_detector = Sapiens2DKeypoint(
-        pose_config="/home/hpm_mv_2/Desktop/SPARC-Project/sapiens/pose/configs/sapiens_pose/coco_wholebody/sapiens_1b-210e_coco_wholebody-1024x768.py",
+        pose_config="/home/hpm_mv_2/Desktop/sapiens/pose/configs/sapiens_pose/coco_wholebody/sapiens_1b-210e_coco_wholebody-1024x768.py",
         pose_checkpoint="/home/hpm_mv_2/Desktop/sapiens_1b_coco_wholebody_best_coco_wholebody_AP_727.pth",
         device="cuda"
     )
