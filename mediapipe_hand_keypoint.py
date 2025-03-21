@@ -4,6 +4,8 @@ import sys
 import cv2
 import mediapipe as mp
 import numpy as np
+import csv
+import os
 
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -58,9 +60,9 @@ class MediaPipeHandKeypoint:
             color_frame (np.ndarray): BGR image from OpenCV.
 
         Returns:
-            A list of hand landmarks (each a list of 21 Landmarks).
-            So the shape is (num_hands_found, 21).
-            Each Landmark has .x, .y, .z (normalized).
+            (hand_landmarks, handedness):
+                hand_landmarks -> list of lists (each sub-list has 21 Landmarks)
+                handedness     -> list of lists (each sub-list has classification(s) for left/right)
         """
         h, w, _ = color_frame.shape
         # Convert BGR -> RGB
@@ -77,8 +79,9 @@ class MediaPipeHandKeypoint:
 
         # Run detection
         results = self.landmarker.detect_for_video(mp_image, timestamp_ms)
-        # results.hand_landmarks -> list of lists, each inner list has 21 Landmarks
-        return results.hand_landmarks
+
+        # Return both landmarks & handedness
+        return results.hand_landmarks, results.handedness
 
     def close(self):
         """Release any resources if needed."""
@@ -92,6 +95,11 @@ def main():
         python mediapipe_hand_keypoints.py [path/to/video or 0 for webcam]
 
     Press 'q' to quit the display window.
+
+    This version:
+      - Converts normalized coords to pixel coords (x * width, y * height).
+      - Labels each detected hand as Left or Right.
+      - Saves all pixel coords to a CSV file named "hand_keypoints.csv".
     """
     # Parse input argument (video file or camera index)
     if len(sys.argv) > 1:
@@ -109,7 +117,6 @@ def main():
         return
 
     # Create our hand keypoint detector
-    # Adjust the path to your actual .task file
     keypoint_detector = MediaPipeHandKeypoint(
         model_path="/home/hpm_mv_2/Desktop/hand_landmarker.task",
         num_hands=2,
@@ -121,6 +128,19 @@ def main():
 
     print("[INFO] Press 'q' to quit.")
 
+    # Prepare CSV output
+    csv_filename = "hand_keypoints.csv"
+    # Overwrite if it already exists
+    if os.path.exists(csv_filename):
+        os.remove(csv_filename)
+
+    csv_file = open(csv_filename, "w", newline="")
+    csv_writer = csv.writer(csv_file)
+    # Write header: frame_index, hand_label, landmark_index, pixel_x, pixel_y
+    csv_writer.writerow(["frame_index", "hand_label", "landmark_index", "pixel_x", "pixel_y"])
+
+    frame_index = 0
+
     while True:
         ret, frame = cap.read()
         if not ret:
@@ -128,27 +148,48 @@ def main():
             break
 
         # Inference for hand landmarks
-        hand_landmarks_list = keypoint_detector.infer_keypoints(frame)
+        hand_landmarks_list, handedness_list = keypoint_detector.infer_keypoints(frame)
 
-        # Draw the landmarks on the frame
         h, w, _ = frame.shape
+        # If any hands found
         if hand_landmarks_list:
-            for hand_landmarks in hand_landmarks_list:
+            # Each element in hand_landmarks_list corresponds to an element in handedness_list
+            for hand_idx, (hand_landmarks, classification_list) in enumerate(
+                zip(hand_landmarks_list, handedness_list)
+            ):
+                # classification_list is a list of classification
+                # the first classification might have category_name = "Left" or "Right"
+                if classification_list:
+                    label = classification_list[0].category_name  # e.g. "Left" or "Right"
+                else:
+                    label = "Unknown"
+
                 # Each hand_landmarks is a list of 21 Landmarks
                 # Landmark.x, Landmark.y in [0,1], so convert to pixel coords
-                for landmark in hand_landmarks:
-                    px, py = int(landmark.x * w), int(landmark.y * h)
+                for lm_idx, landmark in enumerate(hand_landmarks):
+                    px = int(landmark.x * w)
+                    py = int(landmark.y * h)
+
+                    # Draw circle on the frame
                     cv2.circle(frame, (px, py), 5, (0, 255, 0), -1)
+
+                    # Save to CSV
+                    csv_writer.writerow([frame_index, label, lm_idx, px, py])
 
         # Show the annotated frame
         cv2.imshow("MediaPipe Hand Keypoints", frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
+        frame_index += 1
+
     # Cleanup
     cap.release()
     keypoint_detector.close()
+    csv_file.close()
     cv2.destroyAllWindows()
+    print(f"[INFO] Saved keypoints to {csv_filename}")
+
 
 if __name__ == "__main__":
     main()
