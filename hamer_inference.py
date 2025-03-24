@@ -7,6 +7,7 @@ import cv2
 import torch
 import numpy as np
 from pathlib import Path
+import csv
 
 #####################################################################
 # 1) Paths to HaMeR repo and checkpoint
@@ -48,12 +49,8 @@ HARDCODED_VIDEO = "/home/hpm_mv_2/Desktop/camera1.avi"
 
 class HaMer3D:
     """
-    Class to run HaMeR 3D hand mesh estimation either:
-      - On a full video (producing two output videos with overlay & mesh-only)
-      - OR on a single frame in memory (returns overlay, mesh, and 3D data).
-
-    The big 'human detection' part (ViTDet/RegNet) is now commented out.
-    You must provide bounding boxes from MediaPipe or skip ViTPose entirely.
+    Class to run HaMeR 3D hand mesh estimation on a video or single frames.
+    We skip big body detection (ViTDet), so bounding boxes must be provided or dummy.
     """
 
     def __init__(
@@ -101,14 +98,9 @@ class HaMer3D:
         self.hamer_model.to(self.device)
         self.hamer_model.eval()
 
-        # ----------------- Detector Setup (Commented Out) -----------------
-        # Skipping big backbone (ViTDet or RegNet).
+        # ----------------- Skipping big backbone logic -----------------
         # self.body_detector = body_detector
-        # if self.body_detector == "vitdet":
-        #     ...
-        # else:
-        #     ...
-        # print("[INFO] Skipping big body detector! Provide your own bounding boxes or rely on MediaPipe...")
+        # print("[INFO] No big body detection. Provide bounding boxes or skip ViTPose...")
 
         # ----------------- ViTPose (Optional) -----------------
         self.cpm = ViTPoseModel(self.device)
@@ -120,7 +112,7 @@ class HaMer3D:
         self.conf_threshold = conf_threshold
         self.rescale_factor = rescale_factor
 
-        # For video output
+        # Decide output video names
         self.vid_name = Path(self.input_video_path).stem
         if out_overlay_name is None:
             self.out_overlay_name = f"{self.vid_name}_overlay.avi"
@@ -133,17 +125,14 @@ class HaMer3D:
 
     def _process_frame_impl(self, frame_bgr: np.ndarray):
         """
-        Core logic:
-         1) (Removed) Person detection
-         2) (Optional) bounding boxes for ViTPose
-         3) HaMeR 3D mesh
-         4) Render overlay & mesh-only
-
-        NOTE: We skip big detection. Provide your bounding boxes from MediaPipe if needed.
+        1) Provide dummy bounding box or from MediaPipe
+        2) Use ViTPose to refine bounding box
+        3) Run HaMeR => get pred_vertices & pred_joints
+        4) Return overlay, mesh, pred_verts, pred_joints, etc.
         """
 
-        # Step 1) (Removed) Person detection. We'll define a dummy bounding box.
         h, w, _ = frame_bgr.shape
+        # Step 1) Dummy bounding box in center
         center_x, center_y = w // 2, h // 2
         box_size = 100
         x_min = center_x - box_size
@@ -152,17 +141,16 @@ class HaMer3D:
         y_max = center_y + box_size
         hand_bbox = np.array([[x_min, y_min, x_max, y_max]], dtype=np.float32)
         hand_score = np.array([1.0], dtype=np.float32)
-
         det_input = [np.concatenate([hand_bbox, hand_score[:, None]], axis=1)]
 
-        # Step 2) Keypoint detection with ViTPose (optional)
+        # Step 2) ViTPose
         frame_rgb = frame_bgr[:, :, ::-1]
         vitposes_out = self.cpm.predict_pose(frame_rgb, det_input)
         if len(vitposes_out) == 0:
             black = np.zeros_like(frame_bgr)
             return frame_bgr, black, [], [], []
 
-        # Extract bounding boxes from ViTPose keypoints
+        # Extract bounding boxes from keypoints
         bboxes = []
         is_right = []
         for vitposes in vitposes_out:
@@ -188,7 +176,7 @@ class HaMer3D:
             black = np.zeros_like(frame_bgr)
             return frame_bgr, black, [], [], []
 
-        # Step 3) Crop & run HaMeR
+        # Step 3) Create cropped dataset & run HaMeR
         from hamer.datasets.vitdet_dataset import ViTDetDataset
         from hamer.utils.renderer import cam_crop_to_full
         from hamer.utils import recursive_to
@@ -196,19 +184,22 @@ class HaMer3D:
         boxes = np.array(bboxes)
         right_array = np.array(is_right)
         dataset = ViTDetDataset(
-            self.model_cfg, 
-            frame_bgr, 
-            boxes, 
-            right_array, 
+            self.model_cfg,
+            frame_bgr,
+            boxes,
+            right_array,
             rescale_factor=self.rescale_factor
         )
 
         all_verts = []
+        all_joints2d = []  # We'll store 21 joint coords in pixel space
         all_camt  = []
         all_right = []
 
         for i in range(len(dataset)):
             sample = dataset[i]
+
+            # Convert sample['img'] to torch
             if isinstance(sample['img'], np.ndarray):
                 arr = sample['img']
                 if arr.ndim == 3 and arr.shape[-1] == 3:
@@ -217,6 +208,7 @@ class HaMer3D:
             if sample['img'].ndim == 3:
                 sample['img'] = sample['img'].unsqueeze(0)
 
+            # Fix other numeric fields
             if isinstance(sample["box_center"], np.ndarray):
                 bc = torch.from_numpy(sample["box_center"]).float()
                 sample["box_center"] = bc.unsqueeze(0) if bc.ndim == 1 else bc
@@ -239,6 +231,7 @@ class HaMer3D:
             with torch.no_grad():
                 out = self.hamer_model(sample)
 
+            # Flip horizontal param if right hand
             pred_cam = out['pred_cam'].clone()
             multiplier = (2 * sample['right'] - 1)
             pred_cam[:, 1] *= multiplier
@@ -249,6 +242,7 @@ class HaMer3D:
                 * sample['img_size'].max().item()
             )
 
+            # Convert from cropped coords => full
             pred_cam_t_full = cam_crop_to_full(
                 pred_cam,
                 sample["box_center"],
@@ -257,13 +251,57 @@ class HaMer3D:
                 scaled_focal_length
             ).cpu().numpy()[0]
 
+            # (A) Entire mesh
             pred_vertices = out['pred_vertices'][0].cpu().numpy()
             is_right_hand = float(sample['right'])
             pred_vertices[:,0] = (2*is_right_hand - 1)*pred_vertices[:,0]
-
             all_verts.append(pred_vertices)
             all_camt.append(pred_cam_t_full)
             all_right.append(is_right_hand)
+
+            # (B) 21 keypoint landmarks => "pred_joints" (assuming out has that)
+            if "pred_joints" not in out:
+                # If your HaMeR doesn't output this, you can't get the 21 keypoints
+                # You might need a different approach or a different branch
+                all_joints2d.append(None)
+            else:
+                # shape (21, 3) => 3D joint coords in model space
+                pred_joints_3d = out["pred_joints"][0].cpu().numpy()
+                # Flip X if right hand
+                pred_joints_3d[:,0] = (2*is_right_hand - 1)*pred_joints_3d[:,0]
+
+                # Convert from cropped coords => full camera coords
+                joints_cam = cam_crop_to_full(
+                    torch.from_numpy(pred_joints_3d).unsqueeze(0).to(self.device),
+                    sample["box_center"],
+                    sample["box_size"],
+                    sample["img_size"],
+                    scaled_focal_length
+                ).cpu().numpy()[0]  # shape (21,3)
+
+                # Project to 2D
+                # Typically we assume principal point = center of the image
+                # e.g. (cx, cy) = (img_size_x/2, img_size_y/2)
+                # but you can adapt if needed
+                img_size = sample["img_size"][0].cpu().numpy()  # e.g. [width, height]
+                cx = img_size[0] / 2.0
+                cy = img_size[1] / 2.0
+                f  = scaled_focal_length
+
+                X = joints_cam[:,0]
+                Y = joints_cam[:,1]
+                Z = joints_cam[:,2]
+
+                # Avoid division by zero
+                eps = 1e-6
+                Z[Z < eps] = eps
+
+                px = f * X / Z + cx
+                py = f * Y / Z + cy
+
+                # store as Nx2
+                joints_2d = np.stack([px, py], axis=-1)  # shape (21,2)
+                all_joints2d.append(joints_2d)
 
         # Step 4) Render overlay + mesh
         hh, ww, _ = frame_bgr.shape
@@ -291,24 +329,33 @@ class HaMer3D:
         mesh_only_rgb = mesh_rgb * alpha_mesh
         mesh_only_bgr = (mesh_only_rgb[:,:,::-1]*255).astype(np.uint8)
 
-        return overlay_bgr, mesh_only_bgr, all_verts, [], all_right
+        # Return overlay, mesh, plus the 2D joints
+        return overlay_bgr, mesh_only_bgr, all_verts, all_joints2d, all_right
 
     def process_single_frame(self, frame_bgr: np.ndarray):
         """
         Run HaMeR inference on a single BGR frame.
-        Returns (overlay_bgr, mesh_bgr, all_verts, all_camt, all_right).
+        Returns (overlay_bgr, mesh_bgr, all_verts, all_joints2d, all_right).
         """
         return self._process_frame_impl(frame_bgr)
 
     def run_inference(self):
         """
-        Process an entire video => produce 2 output videos:
-            1) <video_stem>_overlay.avi
-            2) <video_stem>_mesh.avi
+        Process an entire video => produce 2 output videos + CSV of 21 keypoints in 2D.
         """
         cap = cv2.VideoCapture(str(self.input_video_path))
         if not cap.isOpened():
             raise IOError(f"[ERROR] Could not open video: {self.input_video_path}")
+
+        # Prepare CSV for 21 keypoint landmarks
+        csv_filename = f"{self.vid_name}_keypoints2d.csv"
+        if os.path.exists(csv_filename):
+            os.remove(csv_filename)
+
+        csv_file = open(csv_filename, "w", newline="")
+        csv_writer = csv.writer(csv_file)
+        # columns: frame_index, hand_index, joint_index, pixel_x, pixel_y
+        csv_writer.writerow(["frame_index", "hand_index", "joint_index", "pixel_x", "pixel_y"])
 
         fourcc = cv2.VideoWriter_fourcc(*'XVID')
         fps    = cap.get(cv2.CAP_PROP_FPS)
@@ -326,21 +373,38 @@ class HaMer3D:
             frame_count += 1
             print(f"[INFO] Processing frame {frame_count}...")
 
-            overlay_bgr, mesh_bgr, _, _, _ = self._process_frame_impl(frame)
+            overlay_bgr, mesh_bgr, _, all_joints2d_list, is_right_list = self._process_frame_impl(frame)
+            # all_joints2d_list is a list of Nx(21,2) or None if no joints
+            # Each element corresponds to one "hand" in that frame
+
             out_overlay.write(overlay_bgr)
             out_mesh.write(mesh_bgr)
+
+            # Save 2D joints to CSV
+            if all_joints2d_list:
+                for hand_idx, joints2d in enumerate(all_joints2d_list):
+                    if joints2d is None:
+                        # If HaMeR didn't produce pred_joints for this hand
+                        continue
+                    # joints2d shape => (21,2)
+                    for j_idx in range(joints2d.shape[0]):
+                        px, py = joints2d[j_idx]
+                        # Write row => frame_count, hand_idx, j_idx, px, py
+                        csv_writer.writerow([frame_count, hand_idx, j_idx, f"{px:.2f}", f"{py:.2f}"])
 
         cap.release()
         out_overlay.release()
         out_mesh.release()
+        csv_file.close()
 
         print("[INFO] Processing complete!")
         print(f"[INFO] Overlay video saved: {self.out_overlay_name}")
         print(f"[INFO] Mesh-only video saved: {self.out_mesh_name}")
+        print(f"[INFO] 2D keypoints saved to {csv_filename}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='HaMeR Inference without Detectron2.')
+    parser = argparse.ArgumentParser(description='HaMeR Inference + 21 keypoints in 2D.')
     parser.add_argument('--video_in', type=str, default=None,
                         help='Path to input video. If omitted, fallback or prompt is used.')
     parser.add_argument('--checkpoint', type=str, default=DEFAULT_CKPT_PATH,
@@ -361,64 +425,18 @@ def main():
         rescale_factor=args.rescale_factor
     )
 
-    # Run inference => produce 2 output videos
+    # Run inference => produce 2 output videos + CSV of 21 keypoints in 2D
     hamer_3d.run_inference()
 
 
 if __name__ == "__main__":
     """
-    Instructions for Using This Script (HaMer3D OOP Pipeline)
-    ---------------------------------------------------------
-    1. Prerequisites:
-    - Python 3.7+ environment with PyTorch, Detectron2, and the HaMeR dependencies installed.
-    - vitpose_model.py present in the same directory or an accessible module path.
-    - The HaMeR repository cloned locally, and the checkpoint file (e.g., hamer.ckpt) placed where needed.
-
-    2. Description:
-    - This script provides an OOP-style approach to run HaMeR for 3D hand mesh estimation on a video,
-      or handle single frames in memory (via process_single_frame()).
-    - It detects persons using Detectron2 (ViTDet or RegNetY), extracts hand bounding boxes via ViTPose,
-      and then runs HaMeR to produce either:
-        (a) Overlaid + mesh-only videos (video-based),
-        (b) A single-frame result (overlay & mesh images + 3D data).
-
-    3. Usage (video):
-      python hamer_inference.py \
-          --video_in /path/to/input_video.mp4 \
-          --checkpoint /path/to/hamer.ckpt \
-          --body_detector vitdet \
-          --conf_threshold 0.5 \
-          --rescale_factor 2.0
-
-    Arguments:
-      --video_in         Path to the input video file. If omitted, uses a fallback or prompts for input.
-      --checkpoint       Path to the HaMeR .ckpt model file (default: /home/hpm_mv_2/Desktop/hamer/...).
-      --body_detector    Choice of 'vitdet' or 'regnety' for the body detection model.
-      --conf_threshold   Confidence threshold for person detection (default: 0.5).
-      --rescale_factor   Scaling factor for hand bounding boxes (default: 2.0).
-
-    4. Expected Outputs (video mode):
-      - Two .avi files in the current directory:
-            <video_stem>_overlay.avi : The original frames with mesh overlay
-            <video_stem>_mesh.avi    : Mesh-only frames on a black background
-
-    5. Single-Frame Usage:
-      import cv2
-      from hamer_inference import HaMer3D
-
-      hamer_3d = HaMer3D(checkpoint="/path/to/hamer.ckpt", ...)
-      frame_bgr = cv2.imread("some_image.jpg")
-      overlay, mesh_only, all_verts, all_camt, all_right = hamer_3d.process_single_frame(frame_bgr)
-      # Now do something with these results.
-
-    6. Notes:
-      - Adjust paths (HAMER_REPO_PATH, DEFAULT_CKPT_PATH, vitpose_model) as needed.
-      - Ensure GPU drivers + CUDA version are compatible with your installed PyTorch.
-      - For single-frame usage in a loop, just keep calling process_single_frame() repeatedly.
-      - We no longer rely on Detectron2 for bounding boxes. Provide bounding boxes from MediaPipe or skip ViTPose.
-      - The dummy bounding box is placed at the center of the frame. Replace that with actual bounding box logic from MediaPipe.
-      - If you already have the entire 21 keypoints from MediaPipe, you can remove or skip the ViTPose step entirely and feed those keypoints directly into HaMeR (which requires deeper changes).
-
-    Enjoy exploring 3D hand pose estimation with HaMeR! Enjoy your smaller VRAM usage without the big ViT-based body detector!
+    Additional Notes:
+    - We assume HaMeR outputs 21 "pred_joints" in out['pred_joints'] => shape (B,21,3).
+    - We do the same camera transform + perspective projection as the mesh.
+    - We store them in CSV => <video_stem>_keypoints2d.csv with columns:
+        frame_index, hand_index, joint_index, pixel_x, pixel_y
+    - If your model doesn't produce out['pred_joints'], you'll need to adapt or generate them.
+    - For multiple hands, each "hand_idx" in all_joints2d_list is processed and appended to CSV.
     """
     main()
