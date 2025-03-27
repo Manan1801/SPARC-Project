@@ -11,9 +11,8 @@ Description:
      - mediapipe_landmarks.csv
      - hamer_landmarks.csv
      - ground_truth.csv
-     - rms_errors.csv
-  4) Generates an interactive Plotly bar chart => 'rms_plot.html'.
-  
+     - rms_errors.csv (with per-keypoint normalized distances)
+
 Usage:
   python process_hands.py /path/to/images --output_dir /path/to/results [--hamer_ckpt /path/to/hamer.ckpt]
 """
@@ -67,16 +66,6 @@ except ImportError:
     ViTPoseModel = None
 
 ########################################
-# Plotly Setup (for RMS)
-########################################
-try:
-    import pandas as pd
-    import plotly.express as px
-except ImportError:
-    print("ERROR: Please install 'pandas' & 'plotly': pip install pandas plotly")
-    sys.exit(1)
-
-########################################
 # CSV Headers
 ########################################
 def build_csv_header():
@@ -88,6 +77,7 @@ def build_csv_header():
         header.append(f"lm_{i}_x")
         header.append(f"lm_{i}_y")
     return header
+
 
 ########################################
 # MediaPipe: 21 2D Landmarks
@@ -118,16 +108,13 @@ def run_mediapipe_on_image(image_bgr):
             results.append(np.array(pts_2d))
     return results
 
+
 ########################################
 # Inverse Crop => Full Pixel
 ########################################
 def uncrop_pred_2d(pred_2d, box_center, box_size, model_res):
     """
     Convert 2D points from model's cropped coords => full-image pixel coords.
-    Assuming top-left origin => [0, model_res], square crop.
-
-    x_full = (x_crop / model_res)*box_size_val + (cx - box_size_val/2)
-    y_full = (y_crop / model_res)*box_size_val + (cy - box_size_val/2)
     """
     x_crop = pred_2d[:, 0]
     y_crop = pred_2d[:, 1]
@@ -137,28 +124,23 @@ def uncrop_pred_2d(pred_2d, box_center, box_size, model_res):
 
     # box_size may be scalar or array
     if isinstance(box_size, np.ndarray):
-        # shape can be 0D => scalar, or (1,), (2,) etc.
         if box_size.ndim == 0:
-            # scalar => shape ()
             box_size_val = float(box_size.item())
         elif box_size.ndim == 1:
-            # e.g. shape(1,) or shape(2,).
             if box_size.size == 1:
                 box_size_val = float(box_size.item())
             else:
-                # shape(2,) => pick one
                 box_size_val = float(box_size[0])
         else:
-            # fallback
             box_size_val = float(box_size.flatten()[0])
     else:
-        # if it's just a float
         box_size_val = float(box_size)
 
     x_full = (x_crop / model_res)*box_size_val + (cx - box_size_val/2.0)
     y_full = (y_crop / model_res)*box_size_val + (cy - box_size_val/2.0)
 
     return np.stack([x_full, y_full], axis=-1)
+
 
 ########################################
 # HaMeR: 21 2D => using pred_keypoints_2d
@@ -223,13 +205,10 @@ class HamerInference:
             for k in ["box_center", "box_size", "img_size"]:
                 val = sample[k]
                 if isinstance(val, np.ndarray):
-                    # shape can be scalar (0D) or small vector
-                    # We do *not* call [0] on it; just wrap it => shape(1,...)
                     val_t = torch.from_numpy(val).float()
                     if val_t.ndim == 0:
-                        # shape ()
-                        val_t = val_t.unsqueeze(0)  # shape(1,)
-                    sample[k] = val_t.unsqueeze(0)  # => shape(1,1) or shape(1,2), etc.
+                        val_t = val_t.unsqueeze(0)
+                    sample[k] = val_t.unsqueeze(0)
 
             if isinstance(sample["right"], (int, float, np.float32)):
                 sample["right"] = torch.tensor(sample["right"], dtype=torch.float32).unsqueeze(0)
@@ -242,39 +221,36 @@ class HamerInference:
             if "pred_keypoints_2d" not in out:
                 continue
 
-            # shape => (B,21,2), typically B=1
             pred_2d_crop = out["pred_keypoints_2d"][0].cpu().numpy()  # (21,2)
 
-            # Inverse the crop
-            # sample["box_center"] => shape(1, D). We'll flatten it
             bc_tensor = sample["box_center"]
             bs_tensor = sample["box_size"]
             model_res = self.model_cfg.MODEL.IMAGE_SIZE
 
-            # Convert them to CPU => might be float or tensor
             if torch.is_tensor(bc_tensor):
-                bc_tensor = bc_tensor.cpu().numpy()  # shape(N, D)
+                bc_tensor = bc_tensor.cpu().numpy()
             if torch.is_tensor(bs_tensor):
                 bs_tensor = bs_tensor.cpu().numpy()
 
-            # box_center => if shape(1,2), flatten to (2,)
             box_center = bc_tensor.flatten()
-            # box_size => might be shape(1,) or shape(1,2), etc.
-            box_size = bs_tensor.flatten()  # shape(...)
+            box_size   = bs_tensor.flatten()
 
-            # We'll pick the first element
-            box_size_val = float(box_size[0])  # e.g. 
-            # If you prefer a safer approach, check if len(box_size)>1
+            box_size_val = float(box_size[0])
 
             pred_2d_full = uncrop_pred_2d(pred_2d_crop, box_center, box_size_val, model_res)
             all_joints2d.append(pred_2d_full)
 
         return all_joints2d
 
+
 ########################################
-# RMS Utility
+# RMS Utilities
 ########################################
 def compute_rms_error(pred_pts, gt_pts):
+    """
+    Legacy function: Returns RMS across all 21 keypoints.
+    (You may or may not need it, but kept here for reference.)
+    """
     if pred_pts.shape != (21,2) or gt_pts.shape != (21,2):
         raise ValueError("Expected shape (21,2) for both pred & gt.")
     diff = pred_pts - gt_pts
@@ -282,49 +258,40 @@ def compute_rms_error(pred_pts, gt_pts):
     mean_sq = np.mean(sq_diff)
     return float(np.sqrt(mean_sq))
 
-########################################
-# Plotting
-########################################
-def generate_rms_plot(rms_csv_path, out_dir):
-    df = pd.read_csv(rms_csv_path)
-    df["mp_rms"]    = pd.to_numeric(df["mp_rms"], errors="coerce")
-    df["hamer_rms"] = pd.to_numeric(df["hamer_rms"], errors="coerce")
 
-    df_melt = df.melt(
-        id_vars="image_name",
-        value_vars=["mp_rms", "hamer_rms"],
-        var_name="method",
-        value_name="rms"
-    )
+def compute_normalized_errors(pred_pts, gt_pts, eps=1e-8):
+    """
+    For each keypoint i:
+      distance_i = Euclidian distance (pred[i] vs. gt[i])
+      origin_dist_i = Euclidian distance (gt[i] vs. origin)
+    => ratio_i = distance_i / (origin_dist_i + eps)
 
-    fig = px.bar(
-        df_melt,
-        x="image_name",
-        y="rms",
-        color="method",
-        barmode="group",
-        title="RMS Error Comparison (MediaPipe vs. HaMeR)",
-        labels={"image_name":"Image","rms":"RMS Error"}
-    )
-    fig.update_layout(
-        xaxis={"type":"category","categoryorder":"category ascending"}
-    )
+    Returns a list of 21 ratios (one per keypoint).
+    """
+    if pred_pts.shape != (21,2) or gt_pts.shape != (21,2):
+        raise ValueError("Expected shape (21,2) for both pred & gt.")
+    ratios = []
+    for i in range(21):
+        px, py = pred_pts[i]
+        gx, gy = gt_pts[i]
+        dist_pred_gt = np.sqrt((px - gx)**2 + (py - gy)**2)
+        dist_gt_origin = np.sqrt((gx**2) + (gy**2))
+        ratio_i = dist_pred_gt / (dist_gt_origin + eps)
+        ratios.append(ratio_i)
+    return ratios
 
-    out_html = out_dir / "rms_plot.html"
-    fig.write_html(str(out_html))
-    print(f"[INFO] RMS plot saved => {out_html}")
 
 ########################################
 # Main
 ########################################
 def main():
     parser = argparse.ArgumentParser(
-        description="MediaPipe + HaMeR (pred_keypoints_2d => uncropped) w/ ground-truth + RMS + Plot."
+        description="MediaPipe + HaMeR (pred_keypoints_2d => uncropped) w/ ground-truth + per-keypoint normalized error (CSV-only)."
     )
     parser.add_argument("root_dir", type=str, help="Root directory of .jpg & .json.")
     parser.add_argument("--hamer_ckpt", type=str, default=DEFAULT_CKPT_PATH,
                         help="Path to HaMeR checkpoint (.ckpt).")
-    parser.add_argument("--output_dir", type=str, default=".", help="Where to save CSVs + plot.")
+    parser.add_argument("--output_dir", type=str, default=".", help="Where to save CSVs.")
     args = parser.parse_args()
 
     root_dir = Path(args.root_dir)
@@ -337,22 +304,31 @@ def main():
     ground_truth_csv_path = out_dir / "ground_truth.csv"
     rms_csv_path          = out_dir / "rms_errors.csv"
 
+    # Build the standard (x,y) landmark CSV headers
     header = build_csv_header()
 
-    # Overwrite CSVs
+    # Overwrite the landmarks CSVs
     with open(mediapipe_csv_path, "w", newline="") as f:
         csv.writer(f).writerow(header)
     with open(hamer_csv_path, "w", newline="") as f:
         csv.writer(f).writerow(header)
     with open(ground_truth_csv_path, "w", newline="") as f:
         csv.writer(f).writerow(header)
+
+    # Build new RMS CSV header => image_name + 21 MP columns + 21 HaMeR columns
+    rms_header = ["image_name"]
+    for i in range(21):
+        rms_header.append(f"mediapipe_kp{i}")
+    for i in range(21):
+        rms_header.append(f"hamer_kp{i}")
+
     with open(rms_csv_path, "w", newline="") as f:
-        csv.writer(f).writerow(["image_name", "mp_rms", "hamer_rms"])
+        csv.writer(f).writerow(rms_header)
 
     # Initialize HaMeR
     hamer_infer = HamerInference(checkpoint=args.hamer_ckpt, rescale_factor=2.0)
 
-    # Find .jpg
+    # Find all .jpg
     all_jpgs = list(root_dir.rglob("*.jpg"))
     all_jpgs.sort()
 
@@ -396,7 +372,6 @@ def main():
             continue
 
         bboxes = np.array(data_dict["bbox"], dtype=np.float32)
-        # clamp bounding box if needed
         h, w = image_bgr.shape[:2]
         for i in range(bboxes.shape[0]):
             x1, y1, x2, y2 = bboxes[i]
@@ -431,36 +406,33 @@ def main():
                 row.append(f"{gy:.2f}")
             writer.writerow(row)
 
-        # 5) RMS => compare first hand from MP & HaMeR to GT
-        mp_rms_value = None
+        # 5) Compute per-keypoint normalized error => pred vs GT, / GT vs origin
+        #    We'll only use the first predicted hand from MP & HaMeR if they exist
+        mp_ratios = [None]*21
+        hamer_ratios = [None]*21
+
         if len(mp_results) > 0:
-            mp_rms_value = compute_rms_error(mp_results[0], gt_keypoints)
-
-        hamer_rms_value = None
+            mp_ratios = compute_normalized_errors(mp_results[0], gt_keypoints)
         if len(hamer_results) > 0:
-            hamer_rms_value = compute_rms_error(hamer_results[0], gt_keypoints)
+            hamer_ratios = compute_normalized_errors(hamer_results[0], gt_keypoints)
 
-        print(f"  -> Found GT => {gt_json}")
-        print(f"  -> MediaPipe RMS => {mp_rms_value if mp_rms_value is not None else 'None'}")
-        print(f"  -> HaMeR RMS     => {hamer_rms_value if hamer_rms_value is not None else 'None'}")
+        # 6) Write row => image_name + 21 MP ratio columns + 21 HaMeR ratio columns
+        row = [image_name]
+        for val in mp_ratios:
+            row.append(f"{val:.4f}" if val is not None else "None")
+        for val in hamer_ratios:
+            row.append(f"{val:.4f}" if val is not None else "None")
 
         with open(rms_csv_path, "a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                image_name,
-                f"{mp_rms_value:.4f}" if mp_rms_value is not None else "None",
-                f"{hamer_rms_value:.4f}" if hamer_rms_value is not None else "None"
-            ])
-
-    # 6) Plot
-    generate_rms_plot(rms_csv_path, out_dir)
+            writer.writerow(row)
 
     print("\n[INFO] Processing complete.")
     print(f"[INFO] MediaPipe CSV   => {mediapipe_csv_path}")
     print(f"[INFO] HaMeR CSV       => {hamer_csv_path}")
     print(f"[INFO] Ground Truth CSV=> {ground_truth_csv_path}")
     print(f"[INFO] RMS CSV         => {rms_csv_path}")
-    print(f"[INFO] Plot            => {out_dir / 'rms_plot.html'}")
+    # Plot references removed; no HTML or Plotly calls.
 
 if __name__ == "__main__":
     main()
