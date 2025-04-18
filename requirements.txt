@@ -1,0 +1,9 @@
+psutil
+numpy
+opencv-python
+pandas
+matplotlib
+pyrealsense2==2.55.1.6486
+rclpy
+sounddevice
+soundfile

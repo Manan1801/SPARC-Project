@@ -7,12 +7,17 @@ import threading
 import numpy as np
 import psutil
 from datetime import datetime
+import os
 
 CAMERA_SERIALS_FILE = "camera_serials.txt"
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 def load_camera_serials():
     serial_map = {}
+    if not os.path.exists(CAMERA_SERIALS_FILE):
+        print(f"[ERROR] File '{CAMERA_SERIALS_FILE}' not found.")
+        return serial_map
+
     with open(CAMERA_SERIALS_FILE, "r") as f:
         for line in f:
             if ":" in line:
@@ -55,19 +60,20 @@ class CameraStream:
                     continue
                 ts = color_frame.get_timestamp()
                 frame = np.asanyarray(color_frame.get_data())
-                now = time.time()
 
                 with self.lock:
                     self.frames.append(frame)
                     if len(self.frames) > 5:
                         self.frames = self.frames[-5:]
+
                     if self.last_ts:
                         time_diff = ts - self.last_ts
                         expected_diff = 1000.0 / 30.0
                         if time_diff > expected_diff * 1.5:
                             self.dropped += 1
+                        self.fps = 1000.0 / time_diff if time_diff > 0 else 0
                     self.last_ts = ts
-                    self.fps = 1000.0 / time_diff if time_diff > 0 else 0
+
             except Exception as e:
                 print(f"[ERROR] {self.label}: {e}")
                 break
@@ -104,6 +110,10 @@ def create_preview_grid(cams, cols=2):
 
 def main():
     serial_map = load_camera_serials()
+    if not serial_map:
+        print("[ERROR] No known camera serials found. Check 'camera_serials.txt'.")
+        return
+
     ctx = rs.context()
     connected_serials = [dev.get_info(rs.camera_info.serial_number) for dev in ctx.query_devices()]
 
@@ -133,7 +143,7 @@ def main():
             if key == 27:  # ESC
                 break
     except KeyboardInterrupt:
-        pass
+        print("\n[INFO] Preview interrupted by user.")
     finally:
         for cam in cameras:
             cam.stop()

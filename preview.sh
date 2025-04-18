@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Activate conda environment
+eval "$(conda shell.bash hook)"
+conda activate data-pipeline
+
 # ------------------------------------------------------------------------------------
 # ⛔ Detect if a recording session is in progress to prevent camera conflicts
 # ------------------------------------------------------------------------------------
@@ -14,4 +18,4 @@ if pgrep -f "rosbag_record_per_camera.py" > /dev/null || pgrep -f "record.sh" > 
 fi
 
 echo "[INFO] Starting live camera previews..."
-python3 ~/preview_all_cams.py
+python3 ~/Desktop/SPARC-Project/scripts/preview_all_cams.py

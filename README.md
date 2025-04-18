@@ -1,54 +1,58 @@
 # 📦 SPARC Data Collection Pipeline
 
-This branch automates synchronized RGB-D data collection from up to **4 fixed RealSense D435i cameras**, saving:
+This branch automates synchronized **RGB-D + Audio** data collection from up to **4 fixed RealSense D435i cameras**, saving:
 
-- 📹 RGB + Depth streams  
-- 🧠 Camera intrinsics  
-- 🛠 RealSense diagnostics (e.g., dropped frames)  
-- 📊 System performance logs (CPU, RAM, Disk I/O)  
-- 🖼 Live RGB stream previews before recording  
+- 📹 RGB + Depth streams (`.bag` raw files)
+- 🔊 Multi-mic audio recordings (simultaneous `.wav` per mic)
+- 🧠 Per-camera intrinsics (`.txt` and `.json`)
+- 📊 System performance logs (CPU, RAM, Disk I/O)
+- 🖼 Live RGB stream previews before recording
+- 🔁 Playback with play/pause + depth/color toggle
 
 ---
 
 ## 🚀 Features
 
-- 🔌 Plug in any **N (1–4)** of 4 pre-defined RealSense cameras  
-- 🧠 Auto-generates `multi_camera.launch` using connected known serials  
-- 📷 Displays real-time previews in a single grid-style window  
-- 📝 Records `.bag` files per camera with selected topics  
-- 🩺 Logs diagnostics like dropped frames  
-- 📊 Logs system CPU, RAM, and Disk I/O  
-- ⏱ Supports **timed recording** with early `Ctrl+C` interrupt  
-- ⛔ Prevents conflicts between preview and recording  
+- 🔌 Plug in any **N (1–4)** of 4 known RealSense cameras
+- 🎙 Records **multi-mic audio** in sync with video
+- 🧠 Auto-generates `multi_camera.launch.py` from connected serials
+- 🧾 Saves **raw .bag** files using RealSense SDK for max compatibility
+- 🎥 **Preview and playback** with play/pause & depth/color toggle
+- 📝 Per-camera `camera_info_<serial>.txt` and `camera_intrinsics_<serial>.json`
+- 📊 Logs system CPU, RAM, and Disk I/O
+- ⏱ Supports **timed recording** via `./record.sh <minutes>`
+- ⛔ Prevents conflicts between preview and recording
 
 ---
 
 ## 🧰 Requirements
 
-- Ubuntu 20.04  
-- ROS Noetic  
-- Intel RealSense SDK + `realsense2_camera` ROS wrapper  
+- Ubuntu 22.04  
+- ROS 2 Humble  
+- Intel RealSense SDK  
 - Python packages:
   ```bash
-  pip install psutil pyrealsense2
+  pip install psutil pyrealsense2 pandas matplotlib sounddevice soundfile
   ```
 
 ---
 
 ## 📁 File Overview
 
-| File                     | Description |
-|--------------------------|-------------|
-| `record.sh`              | 🔴 Timed recording script with safety checks |
-| `preview.sh`             | 👁 Launches real-time camera preview |
-| `preview_all_cams.py`    | 🧠 Streams all RGB cameras in grid view with overlay |
-| `launch_generate.py`     | 📦 Auto-generates ROS launch file from connected known cameras |
-| `camera_serials.txt`     | 📋 Maps cam1–cam4 to fixed RealSense serial numbers |
-| `multi_camera.launch`    | 🔄 Auto-generated ROS launch file |
-| `rosbag_record_per_camera.py` | 📦 Records selected topics from each camera |
-| `diagnostics_logger.py`  | 🩺 Logs dropped frames and diagnostics per cam |
-| `monitor_resources.py`   | 📊 Logs CPU, RAM, Disk during session |
-| `plot_logs.py`           | 📈 Visualizes system + diagnostics logs after session |
+| File                            | Description |
+|---------------------------------|-------------|
+| `record.sh`                     | 🔴 Main script: records video (RealSense) + audio (mic) + system |
+| `preview.sh`                    | 👁 Live grid preview before recording |
+| `playback.sh`                   | 🔁 Plays back camera `.bag` + system plots |
+| `camera_serials.txt`            | 📋 Maps cam1–cam4 to RealSense serials |
+| `launch/`                       | 🛠 Launch files auto-generated for ROS2 (not used for recording) |
+| `scripts/launch_generate.py`   | 🧠 Auto-generates `multi_camera.launch.py` |
+| `scripts/record_realsense.py`  | 📹 Starts RealSense SDK `.bag` + intrinsics dump |
+| `scripts/record_audio_mics.py` | 🔊 Records `.wav` files from physical mics |
+| `scripts/monitor_resources.py` | 📊 Logs CPU, RAM, disk stats during session |
+| `scripts/plot_monitor_log.py`  | 📈 Displays interactive system log graphs |
+| `scripts/realsense_preview_grid.py` | 🎥 Playback visualizer (toggle + pause) |
+| `scripts/preview_all_cams.py`  | 👁 Live RGB preview with FPS/dropped overlay |
 
 ---
 
@@ -61,84 +65,68 @@ cam3:947722072361
 cam4:938322070387
 ```
 
-Update this file with your actual camera serials.
+Update this with your actual RealSense serial numbers.
 
 ---
 
 ## ▶️ Usage Instructions
 
-### 1. (Optional) Use External Drive
+### 1. Preview Camera Feeds (Optional)
 
-By default, recordings are saved to:
-```
-/media/hpm_mv_2/One Touch/SPARC/realsense_recording_<timestamp>/
-```
-
-To save locally instead, edit the path inside `record.sh`:
-```bash
-base_dir="$HOME/realsense_recording_$timestamp"
-```
-
----
-
-### 2. Preview Camera Feeds (Optional)
-
-Check camera positioning and dropped frames:
 ```bash
 ./preview.sh
 ```
 
-✅ Grid-style OpenCV window  
+✅ Grid-style RGB window with FPS & dropped frames  
 ✅ ESC to exit safely  
 ⛔ Warns if a recording is in progress
 
 ---
 
-### 3. Start Timed Recording
+### 2. Start Timed Recording (Video + Audio)
 
 ```bash
 ./record.sh 10
 ```
 
-This records for **10 minutes** and then stops automatically.  
-✅ You can press `Ctrl+C` at any time to stop early.  
-⛔ Warns (or kills) preview if still running.
+- Records **all connected cameras and mics** for **10 minutes**
+- Video: `.bag` (RealSense SDK)
+- Audio: `.wav` per mic (saved to `audio/` subfolder)
+- Logs system stats and saves intrinsics
 
 ---
 
-### 4. Output Example
+### 3. Output Folder Structure
 
 ```
-/media/hpm_mv_2/One Touch/SPARC/realsense_recording_20250414_1830/
-├── cam1_20250414_1830.bag
-├── cam2_20250414_1830.bag
-├── cam3_20250414_1830.bag
-├── cam1_diagnostics.log
-├── cam2_diagnostics.log
-├── system_monitor_20250414_1830.log
+realsense_recording_<timestamp>/
+├── cam1/
+│   ├── cam1_<timestamp>.bag
+│   ├── camera_info_<serial>.txt
+│   ├── camera_intrinsics_<serial>.json
+├── cam2/
+│   └── ...
+├── audio/
+│   ├── mic_hw20_<timestamp>.wav
+│   ├── mic_hw30_<timestamp>.wav
+├── system_monitor_<timestamp>.log
 ```
 
 ---
 
-### 5. Visualize Logs (Optional)
+### 4. Playback and Visualization
 
 ```bash
-python3 plot_logs.py
+./playback.sh
 ```
 
-✅ Enter paths for system and diagnostics logs  
-✅ Shows performance + frame drop plots
+✅ Plays all `.bag` camera streams in sync  
+✅ Interactive system usage plot  
+✅ Controls:
+- `SPACE` or `p` to pause/resume
+- `1`, `2`, `3`, ... to toggle depth/color for each cam
 
 ---
 
-## ✅ Tips
-
-- To record with fewer cameras, change in `record.sh`:
-  ```bash
-  python3 ~/launch_generate.py --num-cameras 2
-  ```
-- Always close preview before starting a recording — or let `record.sh` auto-close it
-
----
-
-For issues, reach out to the Robotics Lab at IIT Gandhinagar.
+For issues, contact the Robotics Lab at IIT Gandhinagar.
+```
