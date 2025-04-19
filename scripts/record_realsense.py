@@ -5,7 +5,7 @@ import os
 import time
 from datetime import datetime
 import threading
-import argparse
+import sys
 import json
 
 CAMERA_SERIALS_FILE = os.path.expanduser("~/Desktop/SPARC-Project/camera_serials.txt")
@@ -44,32 +44,33 @@ def write_camera_info(profile, serial, label, output_path_txt, output_path_json)
 
     intrinsics_data = {}
     for s in profile.get_streams():
-        stream_type = s.stream_type().name
-        fmt = s.format().name
-        stream_key = f"{stream_type.lower()}_{fmt.lower()}"
+        try:
+            video_profile = s.as_video_stream_profile()
+            intr = video_profile.get_intrinsics()
+            stream_type = s.stream_type().name
+            fmt = s.format().name
+            stream_key = f"{stream_type.lower()}_{fmt.lower()}"
 
-        intr = s.as_video_stream_profile().get_intrinsics()
+            with open(output_path_txt, "a") as f:
+                f.write(f"Stream: {stream_type} ({fmt})\n")
+                f.write(f"  Resolution: {video_profile.width()}x{video_profile.height()} @ {video_profile.fps()} FPS\n")
+                f.write(f"  Intrinsics: fx={intr.fx}, fy={intr.fy}, cx={intr.ppx}, cy={intr.ppy}\n")
+                f.write(f"  Distortion Model: {intr.model.name}\n")
+                f.write(f"  Distortion Coeffs: {intr.coeffs}\n\n")
 
-        # Add to text
-        with open(output_path_txt, "a") as f:
-            f.write(f"Stream: {stream_type} ({fmt})\n")
-            f.write(f"  Resolution: {s.width()}x{s.height()} @ {s.fps()} FPS\n")
-            f.write(f"  Intrinsics: fx={intr.fx}, fy={intr.fy}, cx={intr.ppx}, cy={intr.ppy}\n")
-            f.write(f"  Distortion Model: {intr.model.name}\n")
-            f.write(f"  Distortion Coeffs: {intr.coeffs}\n\n")
-
-        # Add to JSON
-        intrinsics_data[stream_key] = {
-            "width": s.width(),
-            "height": s.height(),
-            "fps": s.fps(),
-            "fx": intr.fx,
-            "fy": intr.fy,
-            "cx": intr.ppx,
-            "cy": intr.ppy,
-            "model": intr.model.name,
-            "coeffs": intr.coeffs
-        }
+            intrinsics_data[stream_key] = {
+                "width": video_profile.width(),
+                "height": video_profile.height(),
+                "fps": video_profile.fps(),
+                "fx": intr.fx,
+                "fy": intr.fy,
+                "cx": intr.ppx,
+                "cy": intr.ppy,
+                "model": intr.model.name,
+                "coeffs": intr.coeffs
+            }
+        except Exception as e:
+            print(f"[WARN] Failed to extract stream info: {e}")
 
     with open(output_path_json, "w") as jf:
         json.dump(intrinsics_data, jf, indent=4)
@@ -93,25 +94,18 @@ def record_camera(serial, label, duration_min, base_dir):
         print(f"[INFO] Starting recording for {label} ({serial})")
         pipeline_profile = pipeline.start(config)
 
-        # Save intrinsics
         info_txt = os.path.join(cam_dir, f"camera_info_{serial}.txt")
         info_json = os.path.join(cam_dir, f"camera_intrinsics_{serial}.json")
         write_camera_info(pipeline_profile, serial, label, info_txt, info_json)
 
         time.sleep(duration_min * 60)
-
     except Exception as e:
         print(f"[ERROR] {label} → {e}")
     finally:
         pipeline.stop()
         print(f"[INFO] Finished recording for {label}")
 
-def main():
-    parser = argparse.ArgumentParser(description="Record RealSense RGB+D to .bag with intrinsics")
-    parser.add_argument("output_dir", help="Output directory")
-    parser.add_argument("--duration", type=float, required=True, help="Recording duration in minutes")
-    args = parser.parse_args()
-
+def main(base_dir, duration_min):
     serial_map = load_serial_map()
 
     ctx = rs.context()
@@ -126,14 +120,19 @@ def main():
 
     threads = []
     for serial, label in active:
-        t = threading.Thread(target=record_camera, args=(serial, label, args.duration, args.output_dir))
+        t = threading.Thread(target=record_camera, args=(serial, label, duration_min, base_dir))
         t.start()
         threads.append(t)
 
     for t in threads:
         t.join()
 
-    print(f"[✅] All recordings completed. Saved in: {args.output_dir}")
+    print(f"[✅] All recordings completed. Saved in: {base_dir}")
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Record RealSense .bag files for all connected cameras.")
+    parser.add_argument("output_dir", help="Output directory")
+    parser.add_argument("--duration", type=float, required=True, help="Duration in minutes")
+    args = parser.parse_args()
+    main(args.output_dir, args.duration)
