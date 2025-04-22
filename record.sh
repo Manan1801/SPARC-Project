@@ -40,17 +40,34 @@ echo "[INFO] Starting system monitor..."
 python3 ~/Desktop/SPARC-Project/scripts/monitor_resources.py > "$monitor_log" 2>&1 &
 monitor_pid=$!
 
+# ⏱ Buffer audio to 5s/min extra
+audio_duration_sec=$((duration_minutes * 60 + duration_minutes * 5))
+
 # 🎤 Launch audio mic recording
-echo "[INFO] Starting audio recording for $duration_minutes minutes..."
+echo "[INFO] Starting audio recording for $duration_minutes min (+buffer = $audio_duration_sec sec)..."
 audio_dir="$base_dir/audio"
 mkdir -p "$audio_dir"
-python3 ~/Desktop/SPARC-Project/scripts/record_audio_mics.py "$audio_dir" --duration "$duration_minutes" &
+python3 ~/Desktop/SPARC-Project/scripts/record_audio_mics.py "$audio_dir" --duration "$audio_duration_sec" &
 audio_pid=$!
 
-# 🎥 Start RealSense camera recording
+# 🎥 Start RealSense camera recording (still uses minutes)
 echo "[INFO] Starting RealSense camera recording..."
 python3 ~/Desktop/SPARC-Project/scripts/record_realsense.py "$base_dir" --duration "$duration_minutes" &
 video_pid=$!
+
+# 🕒 Timer — stays on one line until completion
+display_timer() {
+  duration_sec=$((duration_minutes * 60))
+  for ((elapsed=0; elapsed<=duration_sec; elapsed++)); do
+    mins=$((elapsed / 60))
+    secs=$((elapsed % 60))
+    printf "\r[⏳] Recording... Elapsed: %02d:%02d / %02d:00" "$mins" "$secs" "$duration_minutes"
+    sleep 1
+  done
+  echo ""  # move to next line after done
+}
+display_timer &
+timer_pid=$!
 
 # 🚨 Setup interrupt cleanup
 trap_handler() {
@@ -60,7 +77,7 @@ trap_handler() {
 }
 trap trap_handler SIGINT
 
-# ✅ Wait for audio + video and stop monitor
+# ✅ Wait for all processes
 wait $audio_pid $video_pid
-kill $monitor_pid 2>/dev/null
-echo "[✅] All recordings completed. Saved in: $base_dir"
+kill $monitor_pid $timer_pid 2>/dev/null
+echo -e "\n[✅] All recordings completed. Saved in: $base_dir"

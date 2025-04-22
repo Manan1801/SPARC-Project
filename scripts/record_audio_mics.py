@@ -6,53 +6,48 @@ import subprocess
 from datetime import datetime
 import threading
 
-# These are your 2 real USB microphones, based on `arecord -l`:
-# card 2, device 0  → hw:2,0
-# card 3, device 0  → hw:3,0
-VALID_HW_IDS = ["hw:2,0", "hw:3,0"]
+# Devices: USB Audio interfaces
+VALID_MIC_DEVICES = ["hw:2,0", "hw:3,0"]
 
-def record_with_arecord(hw_id, duration_sec, output_dir):
-    label = hw_id.replace(":", "").replace(",", "")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = os.path.join(output_dir, f"mic_{label}_{timestamp}.wav")
-
+def record_from_hw(device_str, output_path, duration_sec):
     cmd = [
         "arecord",
-        "-D", hw_id,
-        "-c", "1",              # 1 channel (mono)
-        "-f", "S16_LE",         # 16-bit little endian
-        "-r", "44100",          # 44100 Hz
+        "-D", device_str,
+        "-f", "cd",
+        "-c", "1",
+        "-r", "44100",
         "-t", "wav",
-        "-d", str(duration_sec),
-        filename
+        "-d", str(int(duration_sec)),
+        output_path
     ]
-
-    print(f"[INFO] 🎙 Recording from {hw_id} → {filename}")
     try:
         subprocess.run(cmd, check=True)
-        print(f"[✅] Saved to {filename}")
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] ❌ Mic {hw_id} failed: {e}")
+        print(f"[ERROR] ❌ Failed recording {device_str}: {e}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Record audio using arecord from valid mic hw devices.")
-    parser.add_argument("output_dir", help="Directory to save recordings")
-    parser.add_argument("--duration", type=float, default=1.0, help="Recording duration in minutes (default: 1)")
+    parser = argparse.ArgumentParser(description="Record from multiple physical mics using arecord.")
+    parser.add_argument("output_dir", help="Directory to save WAV files")
+    parser.add_argument("--duration", type=float, default=60.0, help="Duration in seconds (not minutes)")
     args = parser.parse_args()
 
-    duration_sec = int(args.duration * 60)
     os.makedirs(args.output_dir, exist_ok=True)
-
-    print(f"[INFO] 🎧 Starting parallel recording from {len(VALID_HW_IDS)} mic(s) for {args.duration:.1f} min...")
+    print(f"[INFO] 🎧 Starting parallel recording from {len(VALID_MIC_DEVICES)} mic(s) for {args.duration:.1f} sec...")
 
     threads = []
-    for hw in VALID_HW_IDS:
-        t = threading.Thread(target=record_with_arecord, args=(hw, duration_sec, args.output_dir), daemon=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for dev in VALID_MIC_DEVICES:
+        fname = f"mic_{dev.replace(':','').replace(',','')}_{timestamp}.wav"
+        path = os.path.join(args.output_dir, fname)
+        print(f"[INFO] 🎙 Recording from {dev} → {path}")
+        t = threading.Thread(target=record_from_hw, args=(dev, path, args.duration), daemon=True)
         t.start()
         threads.append(t)
 
     for t in threads:
         t.join()
+        print(f"[✅] Saved to {path}")
 
     print("[✅] All mic recordings completed.")
 
