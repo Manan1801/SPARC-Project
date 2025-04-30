@@ -17,10 +17,21 @@ echo "[INFO] 📁 Creating output directory: $base_dir"
 mkdir -p "$base_dir" || { echo "[ERROR] Failed to create directory: $base_dir"; exit 1; }
 cd "$base_dir" || { echo "[ERROR] Cannot access: $base_dir"; exit 1; }
 
+# 🎥 Ask for camera recording mode
+echo ""
+echo "--------------------------------------------------"
+echo "🎥 CAMERA RECORDING MODE SELECTION"
+echo "--------------------------------------------------"
+echo "  [0] Save individual frames (capture_realsense.py)"
+echo "  [1] Save as raw .bag files (record_realsense.py)"
+echo "--------------------------------------------------"
+read -p "[?] Enter 0 or 1 to select recording mode: " record_mode
+echo ""
+
 # ⛔ Check and kill preview if running
 if pgrep -f "preview_all_cams.py" > /dev/null; then
   echo "[⚠️  WARNING] Preview already running."
-  read -p "Terminate it and continue? (y/N): " yn
+  read -p "[?] Terminate it and continue? (y/N): " yn
   if [[ "$yn" =~ ^[Yy]$ ]]; then
     pkill -f "preview_all_cams.py"
     sleep 2
@@ -30,7 +41,7 @@ if pgrep -f "preview_all_cams.py" > /dev/null; then
   fi
 fi
 
-# 🧠 Activate conda 
+# 🧠 Activate conda
 eval "$(conda shell.bash hook)"
 conda activate data-pipeline || exit 1
 
@@ -50,10 +61,19 @@ echo -e "\n[INFO] 🎧 Starting audio recording for $duration_minutes min (+buff
 python3 ~/Desktop/SPARC-Project/scripts/record_audio_mics.py "$audio_dir" --duration "$audio_duration_sec" &
 audio_pid=$!
 
-# 🎥 Start RealSense camera recording
-echo -e "\n[INFO] 🎥 Starting RealSense camera recording..."
-python3 ~/Desktop/SPARC-Project/scripts/record_realsense.py "$base_dir" --duration "$duration_minutes" &
-video_pid=$!
+if [ "$record_mode" == "0" ]; then
+  echo -e "\n[INFO] 🎥 Starting RealSense frame capturing..."
+  python3 ~/Desktop/SPARC-Project/scripts/capture_realsense.py "$base_dir" --duration "$duration_minutes" &
+  video_pid=$!
+elif [ "$record_mode" == "1" ]; then
+  echo -e "\n[INFO] 🎥 Starting RealSense .bag file recording..."
+  python3 ~/Desktop/SPARC-Project/scripts/record_realsense.py "$base_dir" --duration "$duration_minutes" &
+  video_pid=$!
+else
+  echo "[ERROR] Invalid input. Must be 0 (frames) or 1 (.bag). Exiting."
+  kill $monitor_pid $audio_pid 2>/dev/null
+  exit 1
+fi
 
 # 🕒 Timer — stays on one line until completion
 display_timer() {
