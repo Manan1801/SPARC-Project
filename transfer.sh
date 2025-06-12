@@ -5,7 +5,7 @@ set -euo pipefail
 # Script: transfer.sh
 # Description:
 #   Handles SPARC-Project data transfer:
-#   Mode 0 - Archive latest recording folder, transfer, verify, extract, deep verify
+#   Mode 0 - Stream archive to destination, extract, verify
 #   Mode 1 - Copy each file individually with SHA-256 verify
 # -------------------------------------------------------
 
@@ -39,7 +39,7 @@ stop_timer() {
 
 # -------------------- Prompt Mode --------------------
 echo "Select transfer type:"
-echo "  0) Frames (archive → verify → extract → verify)"
+echo "  0) Frames (stream → extract → verify)"
 echo "  1) Bag files (copy each file individually)"
 while true; do
     read -rp "Enter 0 or 1: " MODE
@@ -54,7 +54,7 @@ if [[ ! -d $latest_folder ]]; then
     log_error "No realsense_recording_* folder found!"
     exit 1
 fi
-log_info "Latest folder: $latest_folder"
+log_info "🟢 Latest folder: $latest_folder"
 
 # -------------------- Setup Destination --------------------
 DEST_BASE="/media/robotics/One Touch/SPARC-Data/April_Pilot"
@@ -69,7 +69,7 @@ fi
 folder="${MO}_${serial}_${DDMM}"
 destination="$DEST_BASE/$folder"
 mkdir -p "$destination"
-log_info "Destination: $destination"
+log_info "📁 Destination: $destination"
 
 # -------------------- Function: Transfer Single File with Verify --------------------
 failures=()
@@ -103,39 +103,24 @@ copy_with_verify() {
     return 1
 }
 
-# -------------------- Mode 0: Archive Transfer --------------------
+# -------------------- Mode 0: Streamed Transfer (No Archive File) --------------------
 if [[ $MODE == "0" ]]; then
-    archive_name="/tmp/$(basename "$latest_folder").tar"
-    log_info "📦 Creating archive $archive_name"
-    tar -cf "$archive_name" -C "$(dirname "$latest_folder")" "$(basename "$latest_folder")"
+    extracted_folder="$destination/$(basename "$latest_folder")"
+    mkdir -p "$extracted_folder"
 
-    src_sum=$(sha256sum "$archive_name" | awk '{print $1}')
-    log_info "🔍 SHA256 of local archive: $src_sum"
-
-    # Copy archive to destination
-    dst_archive="$destination/$(basename "$archive_name")"
-    copy_with_verify "$archive_name" "$dst_archive"
-
-    # Verify destination archive
-    dst_sum=$(sha256sum "$dst_archive" | awk '{print $1}')
-    if [[ "$src_sum" != "$dst_sum" ]]; then
-        log_error "❌ Archive verification failed even after retries!"
-        exit 1
-    fi
-
-    # Extract archive
-    log_info "📂 Extracting archive in destination..."
+    log_info "📦 Streaming and extracting from source to: $extracted_folder"
     start_timer
-    tar -xf "$dst_archive" -C "$destination"
+    tar -C "$(dirname "$latest_folder")" -cf - "$(basename "$latest_folder")" \
+        | tar -xf - -C "$destination"
     stop_timer
-    log_info "✅ Extraction completed."
+    log_info "✅ Extraction via stream completed."
 
-    # Deep verification of extracted files
-    log_info "🔍 Verifying extracted files..."
+    # SHA256 verification
+    log_info "🔍 Verifying extracted files against source..."
     for file in $(find "$latest_folder" -type f); do
         relative_path="${file#$latest_folder/}"
         src_file="$file"
-        dst_file="$destination/$(basename "$latest_folder")/$relative_path"
+        dst_file="$extracted_folder/$relative_path"
         if [[ ! -f "$dst_file" ]]; then
             log_error "❌ Missing file after extraction: $relative_path"
             failures+=("$relative_path")
@@ -148,10 +133,6 @@ if [[ $MODE == "0" ]]; then
             failures+=("$relative_path")
         fi
     done
-
-    # Delete tar files
-    log_info "🧹 Deleting archives..."
-    rm -f "$archive_name" "$dst_archive"
 
 # -------------------- Mode 1: File-by-File Transfer --------------------
 else
