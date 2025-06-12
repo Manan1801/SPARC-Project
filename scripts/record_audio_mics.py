@@ -5,9 +5,12 @@ import argparse
 import subprocess
 from datetime import datetime
 import threading
+from mic_config import VALID_MIC_IDS  # Import your mic config
 
 # Devices: USB Audio interfaces
-VALID_MIC_DEVICES = ["hw:2,0", "hw:3,0"]
+# VALID_MIC_DEVICES = ["hw:3,0", "hw:1,0"]
+
+VALID_MIC_DEVICES = VALID_MIC_IDS  # Use the mic IDs defined in mic_config.py
 
 def record_from_hw(device_str, output_path, duration_sec):
     cmd = [

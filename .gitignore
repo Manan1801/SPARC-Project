@@ -1,0 +1,10 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+
+# VS Code settings
+.vscode/
+
+# Ignore local mic config
+scripts/mic_config.py
+
