@@ -1,0 +1,1 @@
+VALID_MIC_IDS=['hw:1,0','hw:3,0']
