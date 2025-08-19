@@ -3,11 +3,11 @@
 plot_LvNL_cumulative_plotly.py
 
 Plot Learners vs. Non-Learners cumulative movement in ONE interactive Plotly figure,
-with optional piecewise linear regression overlays.
+with optional piecewise linear regression overlays — GREYSCALE with distinct class marker shapes.
 
 Usage:
 python plot_LvNL_cumulative_plotly.py --learner movement_L.csv --nonlearner movement_NL.csv \
-    [--pidL ...] [--pidNL ...] [--keypoints ...] [--regression] [--regwin N] [--maxsegs N] [--penalty P] [--minseg N] [--savepng]
+    [--pidL ...] [--pidNL ...] [--keypoints ...] [--regression] [--regwin N] [--maxsegs N] [--penalty P] [--minseg N] [--save]
 """
 
 import re
@@ -24,6 +24,19 @@ except ImportError:
     rpt = None
 
 COL_RE = re.compile(r'^(?P<hand>[LR])(?P<kp>[0-4])_p(?P<part>\d+)$')
+
+# =========================
+# Greyscale + marker scheme
+# =========================
+# Per-keypoint paired shades: Learners get slightly darker; Non-Learners get lighter.
+L_GREYS  = ["#202020", "#303030", "#404040", "#505050", "#606060", "#707070", "#808080"]
+NL_GREYS = ["#9A9A9A", "#A8A8A8", "#B6B6B6", "#C4C4C4", "#D2D2D2", "#E0E0E0", "#EAEAEA"]
+
+# Distinct marker sets PER CLASS so they differ even for the same keypoint.
+# L_MARKERS  = ["circle", "square", "diamond", "triangle-up", "pentagon", "hexagon", "star"]
+# NL_MARKERS = ["x", "cross", "triangle-down", "triangle-left", "triangle-right", "hourglass", "bowtie"]
+L_MARKERS  = ["circle", "square"]
+NL_MARKERS = ["circle-open", "square-open"]
 
 def parse_args():
     p = argparse.ArgumentParser(description="Learners vs. Non-Learners Plotly plot from cumulative movement CSVs.")
@@ -77,37 +90,73 @@ def compute_linfit(x, y):
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
     return a, b, yfit, r2
 
+# ---- Label laneing helper: staggers annotations per x bucket ----
+class _LanePlacer:
+    """
+    Assigns each annotation to a 'lane' near its x so labels don't overlap.
+    Uses small pixel x/y shifts that are invisible on the data scale but
+    separate stacked labels cleanly.
+    """
+    def __init__(self, x_tolerance=22, y_step=28, x_step=10):
+        # x_tolerance in axis units (seconds here) to group nearby midpoints
+        self.x_tolerance = x_tolerance
+        self.y_step = y_step
+        self.x_step = x_step
+        self._buckets = {}  # bucket_x -> next lane index
+
+        # lane patterns: 0 is center, then up/down, then farther up/down, etc.
+        self._y_mult = [0, +1, -1, +2, -2, +3, -3, +4, -4]
+        self._x_mult = [0, +1, -1, -1, +1, +2, -2, -2, +2]
+
+    def assign(self, x):
+        # snap to an existing bucket if within tolerance
+        bucket_x = None
+        for bx in self._buckets.keys():
+            if abs(bx - x) <= self.x_tolerance:
+                bucket_x = bx
+                break
+        if bucket_x is None:
+            bucket_x = x
+            self._buckets[bucket_x] = 0
+
+        lane = self._buckets[bucket_x]
+        self._buckets[bucket_x] = (lane + 1) % len(self._y_mult)
+
+        yshift = self._y_mult[lane] * self.y_step
+        xshift = self._x_mult[lane] * self.x_step
+        return x, xshift, yshift
+
+# single global placer used by all annotations
+_PLACER = _LanePlacer()
+
 def _add_slope_annotation(fig, x_seg, a, b, y_context, label=None):
     """
-    Place a readable slope label near the middle of a regression segment.
-    - x_seg: 1D array-like of x for this segment
-    - a, b: slope and intercept for the segment
-    - y_context: the y-values for the whole series (used to size the offset)
-    - label: optional series label to prefix the slope
+    Large, readable slope label in Times New Roman, with lane-based staggering
+    in both x and y (pixel space) to avoid overlaps across classes/segments.
     """
     x0, x1 = float(x_seg[0]), float(x_seg[-1])
     xm = 0.5 * (x0 + x1)
     ym = a * xm + b
 
-    # offset the text slightly above (pos slope) or below (neg slope)
-    y_span = float(np.max(y_context) - np.min(y_context)) if len(y_context) else 1.0
-    y_span = y_span if y_span > 0 else 1.0
-    offset = (0.06 * y_span) * (1 if a >= 0 else -1)
+    # get pixel-space shifts for this x bucket
+    _, xshift, yshift = _PLACER.assign(xm)
 
     fig.add_annotation(
-        x=xm,
-        y=ym + offset,
-        # text=(f"{label}: m={a:.3f} mm/s" if label else f"m={a:.3f} mm/s"),
-        text=(f"m={a:.3f} mm/s"),
+        x=xm, y=ym,
+        text=f"m={a:.3f} mm/s",
         showarrow=False,
-        bgcolor="rgba(255,255,255,0.9)",
-        bordercolor="lightgray",
+        bgcolor="rgba(255,255,255,0.95)",
+        bordercolor="gray",
         borderwidth=1,
-        font=dict(size=11),
-        align="center"
+        font=dict(size=18, family="Times New Roman", color="black"),
+        align="center",
+        xshift=xshift,
+        yshift=yshift,
+        yanchor="middle"
     )
 
-def add_piecewise_fixed(fig, x_vals, y_vals, label, win_chunks):
+
+def add_piecewise_fixed(fig, x_vals, y_vals, label, win_chunks, color):
     segcount = 0
     for start in range(0, len(x_vals), win_chunks):
         end = min(start + win_chunks, len(x_vals))
@@ -117,18 +166,18 @@ def add_piecewise_fixed(fig, x_vals, y_vals, label, win_chunks):
         segcount += 1
         fig.add_trace(go.Scatter(
             x=x_vals[start:end], y=yfit, mode="lines",
-            name=f"{label} fit {start+1}-{end}", line=dict(dash="dot"),
+            name=f"{label} fit {start+1}-{end}",
+            line=dict(dash="dot", color=color),
             showlegend=False,
             hovertemplate=(f"Fit: {label}<br>"
                            "Time: %{{x}}s<br>"
                            "Fit value: %{{y:.2f}} mm<br>"
                            f"Slope: {a:.3f} mm/s<br>R²: {r2:.3f}")
         ))
-        # NEW: slope label
         _add_slope_annotation(fig, x_vals[start:end], a, b, y_vals)
     return segcount
 
-def add_piecewise_auto(fig, x_vals, y_vals, label, maxsegs=8, penalty=None, minseg=3):
+def add_piecewise_auto(fig, x_vals, y_vals, label, color, maxsegs=8, penalty=None, minseg=3):
     x_arr = np.asarray(x_vals)
     y_arr = np.asarray(y_vals)
     if len(x_arr) < max(2, minseg * 2):
@@ -138,10 +187,10 @@ def add_piecewise_auto(fig, x_vals, y_vals, label, maxsegs=8, penalty=None, mins
         fig.add_trace(go.Scatter(
             x=x_arr, y=yfit, mode="lines", name=f"{label} (fit)",
             showlegend=False,
-            line=dict(dash="dot"),
+            line=dict(dash="dot", color=color),
             hovertemplate=(f"Fit: {label}<br>Time: %{{x}}s<br>Fit: %{{y:.2f}} mm<br>Slope: {a:.3f} mm/s<br>R²: {r2:.3f}")
         ))
-        _add_slope_annotation(fig, x_arr, a, b, y_arr)  # NEW
+        _add_slope_annotation(fig, x_arr, a, b, y_arr)
         return 1
 
     signal = y_arr.reshape(-1, 1)
@@ -170,10 +219,9 @@ def add_piecewise_auto(fig, x_vals, y_vals, label, maxsegs=8, penalty=None, mins
         fig.add_trace(go.Scatter(
             x=x_arr[s:e], y=yfit, mode="lines", name=f"{label} fit {s+1}-{e}",
             showlegend=False,
-            line=dict(dash="dot"),
+            line=dict(dash="dot", color=color),
             hovertemplate=(f"Fit: {label}<br>Time: %{{x}}s<br>Fit: %{{y:.2f}} mm<br>Slope: {a:.3f} mm/s<br>R²: {r2:.3f}")
         ))
-        # NEW: slope label
         _add_slope_annotation(fig, x_arr[s:e], a, b, y_arr, label)
         segcount += 1
     return segcount
@@ -208,58 +256,78 @@ def main():
     fig = go.Figure()
     cache = []
 
+    # Style index so each keypoint pair gets its own shades + markers
+    style_idx = 0
+
     for kp_label in kp_labels:
         h, k = kp_label[0], int(kp_label[1])
 
+        # Display label normalization from original code
+        display_label = kp_label
         if kp_label[0] == 'L':
-            kp_label = 'R' + kp_label[1:] # Convert to right hand for consistency
+            display_label = 'R' + kp_label[1:]
         elif kp_label[0] == 'R':
-            kp_label = 'L' + kp_label[1:] # Convert to left hand for consistency
+            display_label = 'L' + kp_label[1:]
+
+        # Choose paired colors + class-specific markers for this keypoint index
+        lc = L_GREYS[style_idx % len(L_GREYS)]
+        nlc = NL_GREYS[style_idx % len(NL_GREYS)]
+        lmarker = L_MARKERS[style_idx % len(L_MARKERS)]
+        nlmarker = NL_MARKERS[style_idx % len(NL_MARKERS)]
+        style_idx += 1
 
         cols = groups[(h, k)]
         yL = class_mean_series(dfL, cols, pids=args.pidL)
         yNL = class_mean_series(dfNL, cols, pids=args.pidNL)
 
+        # Learners — solid line, class-specific marker + darker grey
         fig.add_trace(go.Scatter(
-            x=x_secs, y=yL, mode="lines+markers", name=f"{kp_label} (Lrn)",
+            x=x_secs, y=yL, mode="lines+markers", name=f"{display_label} (Lrn)",
+            line=dict(color=lc),  # solid
+            marker=dict(symbol=lmarker, color=lc),
             customdata=[[c] for c in range(1, num_parts + 1)],
-            hovertemplate="Group: Learners<br>Keypoint: " + kp_label +
+            hovertemplate="Group: Learners<br>Keypoint: " + display_label +
                           "<br>Chunk: %{customdata[0]}<br>Time: %{x}s<br>Mean: %{y:.2f} mm"
         ))
-        fig.add_trace(go.Scatter(
-            x=x_secs, y=yNL, mode="lines+markers", name=f"{kp_label} (Nlrn)",
-            customdata=[[c] for c in range(1, num_parts + 1)],
-            hovertemplate="Group: Non-Learners<br>Keypoint: " + kp_label +
-                          "<br>Chunk: %{customdata[0]}<br>Time: %{x}s<br>Mean: %{y:.2f} mm"
-        ))
-        cache.append((f"{kp_label} (Lrn)", x_secs, yL))
-        cache.append((f"{kp_label} (Nlrn)", x_secs, yNL))
 
+        # Non-Learners — solid line, different class marker + lighter grey
+        fig.add_trace(go.Scatter(
+            x=x_secs, y=yNL, mode="lines+markers", name=f"{display_label} (Nlrn)",
+            line=dict(color=nlc),  # solid
+            marker=dict(symbol=nlmarker, color=nlc),
+            customdata=[[c] for c in range(1, num_parts + 1)],
+            hovertemplate="Group: Non-Learners<br>Keypoint: " + display_label +
+                          "<br>Chunk: %{customdata[0]}<br>Time: %{x}s<br>Mean: %{y:.2f} mm"
+        ))
+
+        # Cache for regression overlays (each class keeps its own shade)
+        cache.append((f"{display_label} (Lrn)", x_secs, yL, lc))
+        cache.append((f"{display_label} (Nlrn)", x_secs, yNL, nlc))
+
+    # regression overlays — dotted, in same class shade so distinguishable
     if args.regression:
-        for label, xv, yv in cache:
+        for label, xv, yv, color in cache:
             if args.regwin:
-                add_piecewise_fixed(fig, xv, yv, label, args.regwin)
+                add_piecewise_fixed(fig, xv, yv, label, args.regwin, color)
             else:
                 add_piecewise_auto(fig, xv, yv, label,
+                                   color=color,
                                    maxsegs=args.maxsegs,
                                    penalty=args.penalty,
                                    minseg=args.minseg)
 
     title_bits = ["Learners vs. Non-Learners"]
-    # title_bits.append("L: " + (", ".join(args.pidL) if args.pidL else "all"))
-    # title_bits.append("NL: " + (", ".join(args.pidNL) if args.pidNL else "all"))
-    # title_bits.append("KP: " + ", ".join(kp_labels))
     fig.update_layout(
-        width=1000,   # smaller width
-        height=800,  # smaller height
-        # font=dict(size=14),  # keep labels clear
+        font=dict(size=16, family="Times New Roman", color="black"),
+        width=1000,
+        height=800,
         title=" — ".join(title_bits),
         xaxis_title="Time (seconds)",
         yaxis_title="Cumulative Movement (mm)",
         hovermode="x unified",
         template="plotly_white",
         legend=dict(
-            title="Keypoint",
+            title="Series",
             x=0.75, y=0.99,
             xanchor='right',
             yanchor='top',
@@ -282,7 +350,6 @@ def main():
 
     fig.write_html(out_path, include_plotlyjs="cdn", full_html=True)
     print(f"[OK] Saved interactive plot to {out_path}")
-    
 
 if __name__ == "__main__":
     main()
