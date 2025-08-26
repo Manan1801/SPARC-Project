@@ -91,7 +91,17 @@ def process_camera(cam_dir: Path, fps: int, codec: str, overwrite: bool):
         print(f"⚠️  {cam_dir}: no color/ folder → skipped")
         return
 
-    out_file = color_dir / f"{cam_dir.name}.mp4"      # ← renamed here
+    # Find the parent folder that starts with "AP_"
+    try:
+        ap_parent = next(p for p in cam_dir.parents if p.name.startswith("AP_"))
+    except StopIteration:
+        ap_parent = None
+
+    if ap_parent:
+        out_file = cam_dir / f"{ap_parent.name}_{cam_dir.name}.mp4"
+    else:
+        out_file = cam_dir / f"{cam_dir.name}.mp4"
+
     if out_file.exists() and not overwrite:
         print(f"ℹ️  {out_file} exists – use --overwrite to rebuild")
         return
@@ -114,8 +124,8 @@ def main():
                     help="Path to the recording root")
     ap.add_argument("--fps", type=int, default=30,
                     help="Frames-per-second of the output video (default 30)")
-    ap.add_argument("--codec", default="avc1",
-                    help="FOURCC codec (default avc1 = H.264)")
+    ap.add_argument("--codec", default="mp4v",
+                    help="FOURCC codec (default mp4v = MPEG-4 Part 2)")
     ap.add_argument("--cams", nargs="+", metavar="CAM",
                     help="Subset of cameras to process (e.g. cam1 cam3)")
     ap.add_argument("--overwrite", action="store_true",
