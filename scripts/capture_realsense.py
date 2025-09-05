@@ -6,7 +6,7 @@ import time
 import threading
 import json
 import cv2
-import sys
+import numpy as np
 from datetime import datetime
 
 CAMERA_SERIALS_FILE = os.path.expanduser("~/Desktop/SPARC-Project/camera_serials.txt")
@@ -72,6 +72,13 @@ def write_camera_info(profile, serial, label, output_txt, output_json):
         except Exception as e:
             print(f"[WARN] Skipping stream: {e}")
 
+    # Add alignment metadata
+    intrinsics_data["alignment"] = {
+        "depth_to_color": True,
+        "alignment_target": "color",
+        "use_intrinsics": "color"
+    }
+
     with open(output_json, "w") as jf:
         json.dump(intrinsics_data, jf, indent=4)
 
@@ -93,7 +100,11 @@ def record_camera(serial, label, duration_min, base_dir):
         print(f"[INFO] 🎥 Starting recording for {label} ({serial})")
         pipeline_profile = pipeline.start(config)
 
-        # Save intrinsics info
+        align = rs.align(rs.stream.color)
+        spatial = rs.spatial_filter()
+        temporal = rs.temporal_filter()
+        hole_filling = rs.hole_filling_filter()
+
         info_txt = os.path.join(cam_dir, f"camera_info_{serial}.txt")
         info_json = os.path.join(cam_dir, f"camera_intrinsics_{serial}.json")
         write_camera_info(pipeline_profile, serial, label, info_txt, info_json)
@@ -104,22 +115,29 @@ def record_camera(serial, label, duration_min, base_dir):
 
         while (time.time() - start_time) < duration_sec:
             frames = pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
-            depth_frame = frames.get_depth_frame()
+            aligned_frames = align.process(frames)
+
+            color_frame = aligned_frames.get_color_frame()
+            depth_frame = aligned_frames.get_depth_frame()
 
             if not color_frame or not depth_frame:
                 continue
 
-            color_image = np.asanyarray(color_frame.get_data())
-            depth_image = np.asanyarray(depth_frame.get_data())
+            # Apply filters to depth
+            depth_frame = spatial.process(depth_frame)
+            depth_frame = temporal.process(depth_frame)
+            depth_frame = hole_filling.process(depth_frame)
 
-            # Save color frame as PNG
+            color_image = np.asanyarray(color_frame.get_data())
+            depth_raw = np.asanyarray(depth_frame.get_data())
+
+            # Save color frame
             color_filename = os.path.join(color_dir, f"frame_{frame_count:06d}.png")
             cv2.imwrite(color_filename, color_image)
 
-            # Save depth frame as compressed TIFF
+            # Save depth frame
             depth_filename = os.path.join(depth_dir, f"frame_{frame_count:06d}.tiff")
-            cv2.imwrite(depth_filename, depth_image, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
+            cv2.imwrite(depth_filename, depth_raw, [cv2.IMWRITE_TIFF_COMPRESSION, 1])
 
             frame_count += 1
 
@@ -154,7 +172,6 @@ def main(base_dir, duration_min):
 
 if __name__ == "__main__":
     import argparse
-    import numpy as np
     parser = argparse.ArgumentParser(description="Record RealSense RGB & Depth frames for all connected cameras.")
     parser.add_argument("output_dir", help="Output directory")
     parser.add_argument("--duration", type=float, required=True, help="Duration in minutes")
