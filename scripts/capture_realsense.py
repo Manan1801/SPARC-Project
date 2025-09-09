@@ -5,12 +5,37 @@ import os
 import time
 import threading
 import json
+import signal
+import sys
 import cv2
 import numpy as np
 from datetime import datetime
 
 CAMERA_SERIALS_FILE = os.path.expanduser("~/Desktop/SPARC-Project/camera_serials.txt")
 
+# ── Cooperative control (shared across threads) ────────────────────────────────
+pause_event = threading.Event()   # set() => paused
+stop_event  = threading.Event()   # set() => stop ASAP
+
+def _sig_pause(signum, frame):
+    if not pause_event.is_set():
+        print("\n[⏸] Received SIGUSR1 → PAUSE (frames will NOT be written).", flush=True)
+    pause_event.set()
+
+def _sig_resume(signum, frame):
+    if pause_event.is_set():
+        print("\n[▶] Received SIGUSR2 → RESUME.", flush=True)
+    pause_event.clear()
+
+def _sig_stop(signum, frame):
+    print("\n[⛔] Received SIGINT → Graceful shutdown requested.", flush=True)
+    stop_event.set()
+
+signal.signal(signal.SIGUSR1, _sig_pause)
+signal.signal(signal.SIGUSR2, _sig_resume)
+signal.signal(signal.SIGINT,  _sig_stop)
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def load_serial_map():
     serial_map = {}
     with open(CAMERA_SERIALS_FILE, "r") as f:
@@ -72,7 +97,7 @@ def write_camera_info(profile, serial, label, output_txt, output_json):
         except Exception as e:
             print(f"[WARN] Skipping stream: {e}")
 
-    # Add alignment metadata
+    # Alignment metadata (your earlier addition)
     intrinsics_data["alignment"] = {
         "depth_to_color": True,
         "alignment_target": "color",
@@ -87,10 +112,11 @@ def record_camera(serial, label, duration_min, base_dir):
     config = rs.config()
     config.enable_device(serial)
 
+    # Streams
     config.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     config.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
-    cam_dir = os.path.join(base_dir, label)
+    cam_dir   = os.path.join(base_dir, label)
     color_dir = os.path.join(cam_dir, "color")
     depth_dir = os.path.join(cam_dir, "depth")
     os.makedirs(color_dir, exist_ok=True)
@@ -105,21 +131,29 @@ def record_camera(serial, label, duration_min, base_dir):
         temporal = rs.temporal_filter()
         hole_filling = rs.hole_filling_filter()
 
-        info_txt = os.path.join(cam_dir, f"camera_info_{serial}.txt")
+        # Write camera info once
+        info_txt  = os.path.join(cam_dir, f"camera_info_{serial}.txt")
         info_json = os.path.join(cam_dir, f"camera_intrinsics_{serial}.json")
         write_camera_info(pipeline_profile, serial, label, info_txt, info_json)
 
-        start_time = time.time()
-        duration_sec = duration_min * 60
+        target_active_sec = int(duration_min * 60)
+        active_elapsed = 0
         frame_count = 0
+        last_tick = time.time()
 
-        while (time.time() - start_time) < duration_sec:
+        while not stop_event.is_set() and active_elapsed < target_active_sec:
+            if pause_event.is_set():
+                # Cooperatively paused: do not count time, do not save frames
+                last_tick = time.time()
+                time.sleep(0.05)
+                continue
+
+            # Actively recording
             frames = pipeline.wait_for_frames()
             aligned_frames = align.process(frames)
 
             color_frame = aligned_frames.get_color_frame()
             depth_frame = aligned_frames.get_depth_frame()
-
             if not color_frame or not depth_frame:
                 continue
 
@@ -129,7 +163,7 @@ def record_camera(serial, label, duration_min, base_dir):
             depth_frame = hole_filling.process(depth_frame)
 
             color_image = np.asanyarray(color_frame.get_data())
-            depth_raw = np.asanyarray(depth_frame.get_data())
+            depth_raw   = np.asanyarray(depth_frame.get_data())
 
             # Save color frame
             color_filename = os.path.join(color_dir, f"frame_{frame_count:06d}.png")
@@ -141,10 +175,18 @@ def record_camera(serial, label, duration_min, base_dir):
 
             frame_count += 1
 
+            # Count ACTIVE time only
+            now = time.time()
+            active_elapsed += (now - last_tick)
+            last_tick = now
+
     except Exception as e:
         print(f"[ERROR] {label} → {e}")
     finally:
-        pipeline.stop()
+        try:
+            pipeline.stop()
+        except Exception:
+            pass
         print(f"[INFO] ✅ Finished recording for {label}")
 
 def main(base_dir, duration_min):
@@ -154,14 +196,13 @@ def main(base_dir, duration_min):
     print(f"[INFO] 📸 Connected RealSense serials: {connected_serials}")
 
     active = [(s, serial_map[s]) for s in connected_serials if s in serial_map]
-
     if not active:
         print("[ERROR] No known RealSense cameras found.")
         return
 
     threads = []
     for serial, label in active:
-        t = threading.Thread(target=record_camera, args=(serial, label, duration_min, base_dir))
+        t = threading.Thread(target=record_camera, args=(serial, label, duration_min, base_dir), daemon=True)
         t.start()
         threads.append(t)
 
@@ -172,8 +213,8 @@ def main(base_dir, duration_min):
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Record RealSense RGB & Depth frames for all connected cameras.")
+    parser = argparse.ArgumentParser(description="Record RealSense RGB & Depth frames for all connected cameras (cooperative pause/resume via SIGUSR1/SIGUSR2).")
     parser.add_argument("output_dir", help="Output directory")
-    parser.add_argument("--duration", type=float, required=True, help="Duration in minutes")
+    parser.add_argument("--duration", type=float, required=True, help="ACTIVE duration in minutes")
     args = parser.parse_args()
     main(args.output_dir, args.duration)
