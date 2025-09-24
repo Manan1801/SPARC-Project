@@ -5,9 +5,12 @@ landmark_xyz.py
 Convert 2D (pixel) hand landmarks to 3D (mm) for cam2 with depth aligned to color.
 - Use COLOR intrinsics (fx, fy, cx, cy) from cam2/camera_intrinsics_*.json.
 - --debug flag: writes a concise END-OF-RUN SUMMARY (no anomalies section).
+- If the provided root contains numbered subfolders (01, 02, ...), the script
+       will automatically iterate through each and process their cam2/ folder.
+- --skip lets you skip specific numbered folders (e.g., --skip 03 07 or --skip 03,07).
 
-Layout:
-  <SESSION_ROOT>/
+Expected layout inside each numbered session folder:
+  <PARENT_ROOT>/<NN>/
     cam2/
       color/frame_XXXXXX.png
       depth/frame_XXXXXX.tiff
@@ -20,7 +23,7 @@ Input CSV headers:
   x_0_L_px,y_0_L_px, ... , x_20_L_px,y_20_L_px,
   x_0_R_px,y_0_R_px, ... , x_20_R_px,y_20_R_px
 
-Output:
+Output (per session):
   <SESSION_ROOT>/cam2/CSV/hand_landmark_xyz.csv
   (Flat schema: frame, then *_X_px/*_Y_px, then *_X_mm/*_Y_mm/*_Z_mm)
 """
@@ -34,6 +37,7 @@ import logging
 from datetime import datetime
 from collections import defaultdict, OrderedDict
 import json
+import re
 
 # ====== DEFAULTS / FALLBACKS (used only if JSON intrinsics are missing) ======
 FALLBACK_FX = 604.7083740234375
@@ -104,14 +108,17 @@ def load_color_intrinsics(cam2_dir: Path):
     return fx, fy, cx, cy, intr_file
 
 
-def process_cam2(session_root: Path, visualize: bool, debug: bool):
+def process_cam2(session_root: Path, visualize: bool, debug: bool) -> bool:
+    """
+    Process a single session root that contains cam2/.
+    Returns True if processed (even partially), False if skipped due to missing structure.
+    """
     cam2, color_path, depth_path, csv_dir, logs_dir = find_cam2_paths(session_root)
 
     csv_path = csv_dir / "hand_landmark.csv"
     if not (cam2.exists() and color_path.exists() and depth_path.exists() and csv_path.exists()):
-        print(f"[ERROR] Missing required paths or CSV under: {session_root}")
-        print(f"  cam2: {cam2.exists()}  color/: {color_path.exists()}  depth/: {depth_path.exists()}  CSV/hand_landmark.csv: {csv_path.exists()}")
-        return
+        print(f"[SKIP] {session_root.name}: Missing cam2/color, cam2/depth, or CSV/hand_landmark.csv")
+        return False
 
     # Load COLOR intrinsics (depth is aligned to color)
     fx, fy, cx, cy, intr_file = load_color_intrinsics(cam2)
@@ -129,11 +136,13 @@ def process_cam2(session_root: Path, visualize: bool, debug: bool):
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
-        print(f"[ERROR] Failed to read CSV: {e}")
-        return
+        print(f"[ERROR] {session_root.name}: Failed to read CSV: {e}")
+        return True  # counted as processed attempt
 
     # Ensure numeric frame_id
     df = df[df['frame_id'].apply(lambda x: str(x).strip().isdigit())].copy()
+    if df.empty:
+        print(f"[WARN] {session_root.name}: No numeric frame_id rows found.")
     df['frame_id'] = df['frame_id'].astype(int)
 
     # Output CSV
@@ -302,9 +311,9 @@ def process_cam2(session_root: Path, visualize: bool, debug: bool):
             rows.append({col: data.get(col, "") for col in ordered_cols})
 
         pd.DataFrame(rows, columns=ordered_cols).to_csv(output_csv, index=False)
-        print(f"[OK] Wrote: {output_csv}  (total 3D points: {total_valid_kp})")
+        print(f"[OK] {session_root.name}: wrote {output_csv}  (total 3D points: {total_valid_kp})")
     else:
-        print("[WARN] No valid data to write.")
+        print(f"[WARN] {session_root.name}: No valid data to write.")
 
     # --------- Compact END-OF-RUN SUMMARY (no anomalies) ---------
     if debug:
@@ -354,22 +363,68 @@ def process_cam2(session_root: Path, visualize: bool, debug: bool):
             lines.append("Landmark coverage : all selected landmarks look reasonably covered.")
 
         logging.info("\n".join(lines))
-        print(f"[INFO] Summary log written → {log_path}")
+        print(f"[INFO] {session_root.name}: summary log written → {log_path}")
+
+    return True
+
+
+def _parse_skip_list(skip_args) -> set:
+    """
+    Accepts values like: ['03', '07'] or ['03,07'] or mixed.
+    Returns a set of folder names exactly as they appear (e.g., '03', '7', etc.).
+    """
+    out = set()
+    for item in skip_args or []:
+        parts = re.split(r'[,\s]+', item.strip())
+        for p in parts:
+            if p:
+                out.add(p)
+    return out
 
 
 def main():
-    p = argparse.ArgumentParser(description="Convert 2D (pixel) hand landmarks to 3D (mm) for cam2 with depth aligned to color.")
-    p.add_argument("session_root", type=str, help="Path to the session root containing cam2 (e.g., /path/to/21)")
-    p.add_argument("--visualize", action="store_true", help="Show color/depth with keypoints.")
-    p.add_argument("--debug", action="store_true", help="Write a concise summary log to cam2/logs/ at end of run.")
+    p = argparse.ArgumentParser(description="Batch convert 2D (pixel) hand landmarks to 3D (mm) for cam2 with depth aligned to color.")
+    p.add_argument("root", type=str,
+                   help="Path to a single session (containing cam2/) OR a parent folder containing numbered session folders (e.g., /media/.../HRI_26_sept25/)")
+    p.add_argument("--visualize", action="store_true", help="Show color/depth with keypoints (per session).")
+    p.add_argument("--debug", action="store_true", help="Write a concise summary log to cam2/logs/ at end of each session.")
+    p.add_argument("--skip", nargs="*", default=[],
+                   help="Numbered subfolders to skip under the parent (e.g., --skip 03 07 or --skip 03,07).")
     args = p.parse_args()
 
-    root = Path(args.session_root)
+    root = Path(args.root)
     if not root.exists():
-        print(f"[ERROR] Session root not found: {root}")
+        print(f"[ERROR] Root not found: {root}")
         return
 
-    process_cam2(root, args.visualize, args.debug)
+    # Case 1: root itself is a single session (has cam2/)
+    if (root / "cam2").exists():
+        process_cam2(root, args.visualize, args.debug)
+        return
+
+    # Case 2: root is a parent; iterate numbered subfolders with cam2/
+    skip_set = _parse_skip_list(args.skip)
+    children = sorted([d for d in root.iterdir() if d.is_dir()], key=lambda p: p.name)
+
+    processed_any = False
+    for session_dir in children:
+        name = session_dir.name
+        # only consider folders that look like numbers (e.g., 01, 1, 12, etc.)
+        if not re.fullmatch(r'\d+', name):
+            continue
+        if name in skip_set:
+            print(f"[SKIP] {name}: requested via --skip")
+            continue
+        if not (session_dir / "cam2").exists():
+            print(f"[SKIP] {name}: no cam2/ folder")
+            continue
+
+        print(f"[INFO] Processing session: {name}")
+        processed = process_cam2(session_dir, args.visualize, args.debug)
+        processed_any = processed_any or processed
+
+    if not processed_any:
+        print("[WARN] No sessions were processed. Check folder names and --skip filters.")
 
 
 if __name__ == "__main__":
