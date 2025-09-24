@@ -1,26 +1,21 @@
 #!/usr/bin/env python3
 """
-Two-phase hand labeling with overlap suppression by wrist separation threshold.
+Batch, multi-session version.
 
-Phase 1:
-  - Process first FIRST_TRUSTED_N frames with MediaPipe handedness.
-  - If two wrists are closer than WRIST_SEP_PX, collapse to one (keep higher handedness score).
-  - Write ONLY annotated previews → sample_color_mp/.
-  - Wait for input: "same" or "flip".
+Folder layout (root_dir):
+  /root_dir/
+    1/
+      audio/  cam1/  cam2/  cam3/
+                 └── <COLOR FRAMES FOLDER>  (contains frame_*.png)
+    2/
+      audio/  cam1/  cam2/  cam3/
+                 └── <COLOR FRAMES FOLDER>
+    ...
+    22/
 
-Phase 2:
-  - Produce final outputs for ALL frames:
-      color_mp/ (annotated), CSV/hand_landmark.csv, logs/hand_detection.log
-  - For frames < FIRST_TRUSTED_N:
-      use cached labels (flipped if requested).
-  - For frames >= FIRST_TRUSTED_N:
-      proximity labeling (using last 2-wrist frame as reference).
-      If two wrists are closer than WRIST_SEP_PX:
-          collapse to single hand (keep the one closest to prev L/R wrist),
-          then label by proximity rule.
-
-Usage:
-  python hand_label_proximity_reviewable.py --color_dir /path/to/color_frames
+Per session:
+  • Phase 1 → write previews to cam2/sample_color_mp/, then prompt: "same" or "flip".
+  • Phase 2 → final outputs to cam2/{color_mp, CSV, logs}.
 
 Requirements:
   pip install opencv-python mediapipe pandas
@@ -41,7 +36,7 @@ NUM_LANDMARKS = 21
 FIRST_TRUSTED_N = 100  # frames index 0..99
 
 # <<< EDIT THIS VALUE IF YOU WANT A DIFFERENT COLLAPSE THRESHOLD >>>
-WRIST_SEP_PX = 30  # example from your provided frame
+WRIST_SEP_PX = 30  # pixels: collapse two wrists to one if closer than this
 
 COLOR_LEFT  = (0, 255, 0)   # BGR
 COLOR_RIGHT = (0, 0, 255)
@@ -106,6 +101,19 @@ def list_frames(color_dir: Path):
 def extract_frame_id(name: str):
     m = re.search(r'(\d+)', name)
     return int(m.group(1)) if m else None
+
+def find_color_dir(cam2_dir: Path) -> Path | None:
+    """
+    Strictly use cam2/color as the raw color frames folder.
+    Returns the path only if cam2/color exists and contains frame_*.png.
+    """
+    color = cam2_dir / "color"
+    if not color.is_dir():
+        return None
+    # Require actual raw frames here
+    if not any(color.glob("frame_*.png")):
+        return None
+    return color
 
 def mp_landmarks_to_pixels(landmarks, image_w, image_h):
     pts = np.zeros((NUM_LANDMARKS, 2), dtype=float)
@@ -224,7 +232,7 @@ def label_by_proximity(current_pts_list, prev_left_wrist, prev_right_wrist):
     L = None
     R = None
     if len(current_pts_list) == 2:
-        w0 = current_pts_list[WRIST_ID][0]
+        w0 = current_pts_list[0][WRIST_ID]
         w1 = current_pts_list[1][WRIST_ID]
         d0 = euclid2(w0, prev_left_wrist)
         d1 = euclid2(w1, prev_left_wrist)
@@ -436,24 +444,105 @@ def phase2_full_run(frames, cached_firstN, user_choice, parent_dir, hands_detect
     log.summary(summary)
     log.write()
 
-# ----------------------- Main -----------------------
-def main():
-    ap = argparse.ArgumentParser(description="Two-phase hand labeling with preview + user choice (same/flip) and overlap suppression")
-    ap.add_argument("--color_dir", required=True, help="Path to folder with frame_*.png")
-    args = ap.parse_args()
+# ----------------------- Helper: Already Processed Sessions  -----------------------
+def session_already_processed(cam2_dir: Path, color_dir: Path) -> bool:
+    """
+    Heuristics to decide if a session is already fully processed:
+      - CSV exists and is non-empty
+      - color_mp exists and has >= as many annotated frames as input frames
+      - logs/hand_detection.log exists and contains a SUMMARY line
+    """
+    csv_path = cam2_dir / "CSV" / "hand_landmark.csv"
+    out_img_dir = cam2_dir / "color_mp"
+    log_path = cam2_dir / "logs" / "hand_detection.log"
 
-    color_dir = Path(args.color_dir).resolve()
-    if not color_dir.is_dir():
-        raise FileNotFoundError(f"color_dir not found: {color_dir}")
+    if not csv_path.is_file() or csv_path.stat().st_size == 0:
+        return False
+    if not out_img_dir.is_dir():
+        return False
 
-    parent = color_dir.parent
+    n_in = len(list_frames(color_dir))
+    n_out = len(sorted(out_img_dir.glob("frame_*.png")))
+    if n_out < n_in:
+        return False
+
+    if not log_path.is_file() or log_path.stat().st_size == 0:
+        return False
+    try:
+        tail = log_path.read_text(errors="ignore")[-2000:]
+        if "===== SUMMARY =====" not in tail and "SUMMARY" not in tail:
+            return False
+    except Exception:
+        return False
+
+    return True
+
+# ----------------------- Session Process -----------------------
+def process_session(session_dir: Path, hands_detector):
+    cam2 = session_dir / "cam2"
+    if not cam2.is_dir():
+        print(f"[SKIP] {session_dir.name}: missing cam2/")
+        return
+
+    color_dir = find_color_dir(cam2)
+    if color_dir is None:
+        print(f"[SKIP] {session_dir.name}: no folder under cam2/ with frame_*.png")
+        return
+
+    frames = list_frames(color_dir)
+    if not frames:
+        print(f"[SKIP] {session_dir.name}: found color dir but no frames")
+        return
+
+    # >>> NEW: skip if already processed
+    if session_already_processed(cam2, color_dir):
+        print(f"[SKIP] {session_dir.name}: already processed (CSV+color_mp+SUMMARY present).")
+        return
+    # <<<
+
+    parent = color_dir.parent  # cam2/
     out_preview_dir = parent / "sample_color_mp"
     out_logs_dir = parent / "logs"
     log = DebouncedLogger(out_logs_dir / "hand_detection.log")
 
-    frames = list_frames(color_dir)
-    if not frames:
-        raise RuntimeError(f"No frames like frame_*.png in {color_dir}")
+    # Phase 1
+    log.info(f"[{session_dir.name}] Phase 1: Preview first {FIRST_TRUSTED_N} frames in {out_preview_dir} "
+             f"(overlap threshold {WRIST_SEP_PX:.2f}px)")
+    cached_firstN = phase1_preview_first_n(frames, out_preview_dir, hands_detector, log)
+    log.info(f"[{session_dir.name}] Preview ready. Inspect 'sample_color_mp/'.")
+    log.write()
+
+    # Wait
+    # prompt = (f'[{session_dir.name}] Enter "same" to keep labels, or "flip" to swap L/R for the first '
+    #           f'{FIRST_TRUSTED_N} frames: ')
+    # choice = input(prompt).strip().lower()
+    choice = "flip"  # or "same"
+
+    # Phase 2
+    log.info(f"[{session_dir.name}] Phase 2: Final outputs with user choice = {choice}")
+    phase2_full_run(frames, cached_firstN, choice, parent, hands_detector, log)
+
+    print(f"[DONE] {session_dir.name}")
+
+
+# ----------------------- Main -----------------------
+def main():
+    ap = argparse.ArgumentParser(description="Batch two-phase hand labeling over sessions 1..22 (cam2 only)")
+    ap.add_argument("--root_dir", required=True, help="Path to directory containing session folders 1..22")
+    args = ap.parse_args()
+
+    root_dir = Path(args.root_dir).resolve()
+    if not root_dir.is_dir():
+        raise FileNotFoundError(f"root_dir not found: {root_dir}")
+
+    # Gather numeric session dirs (supports 01..22 and 1..22). We'll process in numeric order and silently skip missing ones.
+    session_dirs = sorted(
+        [p for p in root_dir.iterdir()
+         if p.is_dir() and re.fullmatch(r"\d+", p.name) and 1 <= int(p.name) <= 22],
+        key=lambda p: int(p.name)
+    )
+    if not session_dirs:
+        raise RuntimeError(f"No numeric session folders (1..22) found under {root_dir}")
 
     with mp_hands.Hands(
         static_image_mode=False,
@@ -462,24 +551,10 @@ def main():
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5
     ) as hands_detector:
+        for sdir in session_dirs:
+            print(f"\n===== Processing session: {sdir.name} =====")
+            process_session(sdir, hands_detector)
 
-        # Phase 1
-        log.info(f"Phase 1: Preview first {FIRST_TRUSTED_N} frames to {out_preview_dir} "
-                 f"(overlap threshold {WRIST_SEP_PX:.2f}px)")
-        cached_firstN = phase1_preview_first_n(frames, out_preview_dir, hands_detector, log)
-        log.info("Preview ready. Please inspect 'sample_color_mp/'.")
-        log.write()
-
-        # Wait
-        # choice = input(f'Enter "same" to keep labels, or "flip" to swap L/R for the first {FIRST_TRUSTED_N} frames: ').strip().lower()
-        choice = "flip" # for full auto run
-        if choice not in {"same", "flip"}:
-            print('Unrecognized input. Defaulting to "same".')
-            choice = "same"
-
-        # Phase 2
-        log.info(f"Phase 2: Final outputs with user choice = {choice}")
-        phase2_full_run(frames, cached_firstN, choice, parent, hands_detector, log)
 
 if __name__ == "__main__":
     main()
