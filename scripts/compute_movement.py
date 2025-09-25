@@ -10,15 +10,27 @@ Also creates a debug log per participant if --debug is set.
 Usage example:
     python scripts/compute_movement.py --csv_path ../data/01/cam2/CSV/hand_landmark_xyz.csv --start_time 10 --stop_time 70 --debug
 
-Workflow:
+Workflow (overall window):
   1) First-pass per-frame movement (strict Euclidean to last previous valid sample).
   2) Per-keypoint outlier detection via IQR (Q1, Q3; IQR=Q3-Q1; outliers < Q1-1.5*IQR or > Q3+1.5*IQR).
   3) Mark outlier frames as "missing" for THAT keypoint only.
   4) Recompute movement series/totals on the cleaned data.
-  5) For each keypoint (h_k), compute speed using its own effective duration:
-        effective_duration_{h_k} = raw_duration - (removed_frames_{h_k} / FPS)
-     and speed_{h_k} = movement_{h_k} / effective_duration_{h_k}.
+  5) For each keypoint (h_k), compute speed using keypoint-specific effective duration:
+        eff_dur_{h_k} = raw_duration - (removed_frames_{h_k} / FPS)
+     speed_{h_k} = movement_{h_k} / eff_dur_{h_k}.
   6) Append totals and per-keypoint speeds to movement_n_speed.csv.
+
+Per-part mode (controlled by --parts, default 3):
+  A) Split the raw window into N whole-second parts (remainder seconds to the last part).
+  B) For each part, recompute movement per keypoint on the cleaned data (outliers treated as missing).
+  C) For each keypoint & part, compute:
+        eff_dur_{h_k, part} = part_seconds - (removed_frames_{h_k} in that part / FPS)
+        speed_{h_k, part}   = movement_{h_k, part} / eff_dur_{h_k, part}
+  D) Append a SINGLE FLAT ROW per participant to 3Equal_parts_movement.csv:
+      Participant ID, Duration,
+      <L_0_move_p1>.. <R_4_move_p1>, <L_0_speed_p1>.. <R_4_speed_p1>,
+      ...
+      <L_0_move_pN>.. <R_4_move_pN>, <L_0_speed_pN>.. <R_4_speed_pN>
 
 Requires: pandas, numpy
 
@@ -61,6 +73,7 @@ KEYPOINTS = [0, 1, 2, 3, 4]
 HANDS = ['L', 'R']
 FPS = 30
 OUT_CSV = 'movement_n_speed.csv'
+OUT_PARTS_CSV = '3Equal_parts_movement.csv'
 
 def parse_args():
     p = argparse.ArgumentParser(description="Compute 3D movement per keypoint for a participant.")
@@ -68,6 +81,8 @@ def parse_args():
     p.add_argument('--start', type=float, required=True, help='Start time in seconds')
     p.add_argument('--stop', type=float, required=True, help='Stop time in seconds')
     p.add_argument('--debug', action='store_true', help='If set, also write summary log & plots')
+    p.add_argument('--parts', type=int, default=3,
+                   help='Split the window into N whole-second parts (default: 3) and write a flat per-part row per participant')
     return p.parse_args()
 
 def find_numbered_folder(csv_path: Path) -> Optional[Path]:
@@ -101,7 +116,7 @@ def compute_movement_series(df: pd.DataFrame, hand: str, kp: int,
                             treat_missing_idx: Optional[Set[int]] = None
                             ) -> Tuple[float, List[Optional[float]]]:
     """
-    Compute total movement and per-frame series for a single keypoint.
+    Compute total movement and per-frame series for a single keypoint (over the provided df slice).
     treat_missing_idx: row indices (within df) to be treated as missing for this keypoint (e.g., outliers).
     """
     cols = [f"{hand}_{kp}_X_mm", f"{hand}_{kp}_Y_mm", f"{hand}_{kp}_Z_mm"]
@@ -136,27 +151,20 @@ def compute_movement_series(df: pd.DataFrame, hand: str, kp: int,
     return total, per_frame
 
 def iqr_outliers(values: List[Optional[float]]) -> Set[int]:
-    """
-    Return indices (into 'values') that are outliers by IQR rule.
-    None entries are ignored. Uses Q1, Q3 via numpy.percentile.
-    """
+    """Return indices (into 'values') that are outliers by IQR rule. None entries are ignored."""
     data = [v for v in values if v is not None]
     if len(data) == 0:
         return set()
-
     arr = np.array(data, dtype=float)
-    # Use default linear interpolation method (NumPy 1.22+ uses 'method', older uses 'interpolation')
     try:
         q1 = np.percentile(arr, 25.0, method='linear')
         q3 = np.percentile(arr, 75.0, method='linear')
     except TypeError:
         q1 = np.percentile(arr, 25.0)
         q3 = np.percentile(arr, 75.0)
-
     iqr = q3 - q1
     lo = q1 - 1.5 * iqr
     hi = q3 + 1.5 * iqr
-
     out_idx = set()
     for i, v in enumerate(values):
         if v is None:
@@ -173,7 +181,7 @@ def main():
         raise ValueError("stop_time must be greater than start_time.")
     start_frame = int(args.start * FPS)
     stop_frame  = int(args.stop  * FPS)
-    raw_duration = round(args.stop - args.start, 4)
+    raw_duration = round(args.stop - args.start, 4)  # seconds (float)
 
     # Participant & dirs
     participant_id, logs_dir, plots_dir = get_paths(csv_path)
@@ -197,7 +205,7 @@ def main():
             _, series_pre = compute_movement_series(df, hand, kp, treat_missing_idx=None)
             per_kp_series_pre[tag] = series_pre
 
-    # If --debug: save pre-filter box & whisker plot (shows outliers)
+    # If --debug: save pre-filter boxplot (outliers shown)
     if args.debug:
         try:
             import plotly.graph_objects as go
@@ -231,7 +239,7 @@ def main():
     else:
         box_html_path = None
 
-    # ---------- Detect outliers per keypoint (IQR on pre-filter series) ----------
+    # ---------- Detect outliers per keypoint ----------
     outlier_idx_by_kp: Dict[str, Set[int]] = {}
     removed_frames_count_by_kp: Dict[str, int] = {}
     effective_duration_by_kp: Dict[str, float] = {}
@@ -243,13 +251,12 @@ def main():
             outlier_idx_by_kp[tag] = idxs
             removed_frames_count_by_kp[tag] = len(idxs)
             eff_dur = raw_duration - (len(idxs) / FPS)
-            # Guardrail: never less than a tiny epsilon to avoid div-by-zero
             effective_duration_by_kp[tag] = max(eff_dur, 1e-9)
 
-    # ---------- Second pass: recompute with outliers removed (treated as missing) ----------
+    # ---------- Second pass: recompute with outliers removed ----------
     per_kp_total: Dict[str, float] = {}
     per_kp_series: Dict[str, List[Optional[float]]] = {}
-    movement_values: List[float] = []  # order: [L_0..L_4, R_0..R_4]
+    movement_values: List[float] = []
 
     for hand in HANDS:
         for kp in KEYPOINTS:
@@ -259,34 +266,108 @@ def main():
             per_kp_series[tag] = series
             movement_values.append(total)
 
-    # Per-hand totals (movement only; speed shown against raw duration to avoid mixing durations)
+    # Per-hand totals & grand total (movement only)
     per_hand = {h: sum(per_kp_total[f"{h}_{k}"] for k in KEYPOINTS) for h in HANDS}
     grand_total = sum(movement_values)
 
-    # ---------- Per-keypoint speeds using per-keypoint effective duration ----------
+    # Per-keypoint speeds using per-kp effective duration
     per_kp_speed: Dict[str, float] = {}
     for hand in HANDS:
         for kp in KEYPOINTS:
             tag = f"{hand}_{kp}"
             per_kp_speed[tag] = round(per_kp_total[tag] / effective_duration_by_kp[tag], 4)
 
-    # Build CSV row (speeds reflect per-kp effective durations)
-    duration_for_csv = raw_duration  # Keep original duration column as raw window length
-    output_row = [participant_id, duration_for_csv] \
-                 + [round(per_kp_total[f"{h}_{k}"], 4) for h in HANDS for k in KEYPOINTS] \
-                 + [per_kp_speed[f"{h}_{k}"] for h in HANDS for k in KEYPOINTS]
-
-    header = ['Participant ID', 'Duration'] + \
-             [f"{h}_{k}_move" for h in HANDS for k in KEYPOINTS] + \
-             [f"{h}_{k}_speed" for h in HANDS for k in KEYPOINTS]
+    # ---------- Write overall CSV ----------
+    header_overall = ['Participant ID', 'Duration'] + \
+                     [f"{h}_{k}_move" for h in HANDS for k in KEYPOINTS] + \
+                     [f"{h}_{k}_speed" for h in HANDS for k in KEYPOINTS]
+    row_overall = [participant_id, raw_duration] \
+                  + [round(per_kp_total[f"{h}_{k}"], 4) for h in HANDS for k in KEYPOINTS] \
+                  + [per_kp_speed[f"{h}_{k}"] for h in HANDS for k in KEYPOINTS]
 
     file_exists = os.path.isfile(OUT_CSV)
     with open(OUT_CSV, 'a') as f:
         if not file_exists:
-            f.write(','.join(header) + '\n')
-        f.write(','.join(str(val) for val in output_row) + '\n')
+            f.write(','.join(header_overall) + '\n')
+        f.write(','.join(str(v) for v in row_overall) + '\n')
 
-    # ----- If --debug: save post-filter line plot & write outlier summary log -----
+    # ========== Per-part computation (flat row per participant) ==========
+    if args.parts and args.parts > 0:
+        # Whole-seconds split on RAW duration
+        total_seconds_int = int(math.floor(raw_duration))
+        num_parts = args.parts
+        base_sec = total_seconds_int // num_parts
+        remainder_sec = total_seconds_int % num_parts
+        part_durations_sec = [base_sec] * (num_parts - 1) + [base_sec + remainder_sec]
+
+        # Absolute frame bounds (inclusive start, exclusive end) per part
+        part_bounds = []
+        acc_sec = 0
+        for secs in part_durations_sec:
+            part_start_frame = start_frame + acc_sec * FPS
+            part_end_frame   = start_frame + (acc_sec + secs) * FPS
+            acc_sec += secs
+            part_bounds.append((part_start_frame, part_end_frame))
+
+        # Build FLAT header for parts file (once)
+        def part_cols(suffix: str, p_idx: int) -> List[str]:
+            return [f"{h}_{k}_{suffix}_p{p_idx}" for h in HANDS for k in KEYPOINTS]
+
+        flat_header = ['Participant ID', 'Duration']
+        for p_idx in range(1, num_parts + 1):
+            flat_header += part_cols('move', p_idx)
+            flat_header += part_cols('speed', p_idx)
+
+        # Compute per-part movement/speed (post-filter) and flatten into one row
+        flat_values: List[str] = [participant_id, str(raw_duration)]
+
+        for p_idx, (f_start, f_end) in enumerate(part_bounds, start=1):
+            # Rows for this part by true frame numbers
+            mask = (df['frame'] >= f_start) & (df['frame'] < f_end)
+            df_part = df.loc[mask].reset_index(drop=True)
+            frames_part = df.loc[mask, 'frame'].tolist()
+
+            # Map global → local indices inside df_part
+            global_indices = np.where(mask.to_numpy())[0].tolist()
+            global_to_local = {g: i for i, g in enumerate(global_indices)}
+
+            # Movement & speed per keypoint for this part
+            move_list_this_part: List[float] = []
+            speed_list_this_part: List[float] = []
+
+            for hand in HANDS:
+                for kp in KEYPOINTS:
+                    tag = f"{hand}_{kp}"
+                    # Outliers for this kp limited to this part (local indices)
+                    outlier_locals: Set[int] = set()
+                    for g_idx in outlier_idx_by_kp[tag]:
+                        if g_idx in global_to_local:
+                            outlier_locals.add(global_to_local[g_idx])
+
+                    total_part, _series_part = compute_movement_series(
+                        df_part, hand, kp, treat_missing_idx=outlier_locals
+                    )
+
+                    # Effective duration for this part & kp
+                    part_secs = part_durations_sec[p_idx - 1]  # whole seconds for this part
+                    eff_dur_part = max(part_secs - (len(outlier_locals) / FPS), 1e-9)
+                    speed_part = round(total_part / eff_dur_part, 4)
+
+                    move_list_this_part.append(round(total_part, 4))
+                    speed_list_this_part.append(speed_part)
+
+            # Append moves then speeds for this part
+            flat_values += [str(v) for v in move_list_this_part]
+            flat_values += [str(v) for v in speed_list_this_part]
+
+        # Append the single flat row to 3Equal_parts_movement.csv
+        parts_exists = os.path.isfile(OUT_PARTS_CSV)
+        with open(OUT_PARTS_CSV, 'a') as f:
+            if not parts_exists:
+                f.write(','.join(flat_header) + '\n')
+            f.write(','.join(flat_values) + '\n')
+
+    # ----- If --debug: save post-filter line plot & write outlier/summary log -----
     line_html_path = None
     if args.debug:
         # Post-filter line plot (reflects cleaned data)
@@ -313,32 +394,32 @@ def main():
                 hovermode='x unified',
                 template='plotly_white',
             )
-            line_html_path = plots_dir / f"move_plot_{participant_id}.html"
+            line_html_path = plots_dir / f"move_lineplot_{participant_id}.html"
             pio.write_html(fig_line, file=str(line_html_path), auto_open=False, include_plotlyjs='cdn')
             print(f"[ℹ] Line plot saved to: {line_html_path}")
 
-        # Log end-of-session summary + outliers + per-kp effective durations
+        # Log end-of-session summary + outliers + per-kp effective durations + per-part details
         debug_log.write(f"Participant: {participant_id}\n")
         debug_log.write(f"CSV: {csv_path}\n")
         debug_log.write(f"Window: start={args.start}s stop={args.stop}s raw_duration={raw_duration}s\n")
         debug_log.write(f"Frames: {start_frame}..{stop_frame-1} (FPS={FPS})\n\n")
 
         debug_log.write("===== OUTLIER REMOVAL (IQR rule) =====\n")
-        total_removed = 0
+        total_removed_overall = 0
         for hand in HANDS:
             for kp in KEYPOINTS:
                 tag = f"{hand}_{kp}"
                 idxs = sorted(outlier_idx_by_kp[tag])
                 frames = [frame_numbers[i] for i in idxs]
-                total_removed += len(frames)
+                total_removed_overall += len(frames)
                 eff = effective_duration_by_kp[tag]
                 debug_log.write(f"{tag}: removed {len(frames)} frame(s) | eff_dur={eff:.4f}s")
                 if frames:
                     debug_log.write(" | frames=" + ",".join(str(fr) for fr in frames))
                 debug_log.write("\n")
-        debug_log.write(f"TOTAL removed (sum over keypoints): {total_removed}\n\n")
+        debug_log.write(f"TOTAL removed (sum over keypoints): {total_removed_overall}\n\n")
 
-        debug_log.write("===== END OF SESSION SUMMARY =====\n")
+        debug_log.write("===== END OF SESSION SUMMARY (overall window) =====\n")
         debug_log.write("Per-Hand Totals (movement mm | speed mm/s using raw_duration):\n")
         for h in HANDS:
             mv = per_hand[h]
@@ -354,10 +435,48 @@ def main():
                 sp = per_kp_speed[tag]
                 eff = effective_duration_by_kp[tag]
                 debug_log.write(f"  {tag}: total={mv:.4f} | speed={sp:.4f} | eff_dur={eff:.4f}s\n")
+
+        # Per-part details (only if parts requested)
+        if args.parts and args.parts > 0:
+            debug_log.write("\n===== PER-PART DETAILS =====\n")
+            # Recompute just for logging the removed frames and eff_dur_part (already used above)
+            total_seconds_int = int(math.floor(raw_duration))
+            num_parts = args.parts
+            base_sec = total_seconds_int // num_parts
+            remainder_sec = total_seconds_int % num_parts
+            part_durations_sec = [base_sec] * (num_parts - 1) + [base_sec + remainder_sec]
+            acc_sec = 0
+            for p_idx, secs in enumerate(part_durations_sec, start=1):
+                f_start = start_frame + (acc_sec * FPS)
+                f_end   = start_frame + ((acc_sec + secs) * FPS)
+                acc_sec += secs
+                debug_log.write(f"--- Part {p_idx} ---\n")
+                debug_log.write(f"Frames: {f_start}..{f_end-1} | Part_Duration={secs}s\n")
+
+                mask = (df['frame'] >= f_start) & (df['frame'] < f_end)
+                global_indices = np.where(mask.to_numpy())[0].tolist()
+                global_to_local = {g: i for i, g in enumerate(global_indices)}
+                for hand in HANDS:
+                    for kp in KEYPOINTS:
+                        tag = f"{hand}_{kp}"
+                        # frames removed in this part
+                        frames_removed = []
+                        for g_idx in sorted(outlier_idx_by_kp[tag]):
+                            if g_idx in global_to_local:
+                                frames_removed.append(frame_numbers[g_idx])
+                        eff_dur_part = secs - (len(frames_removed) / FPS)
+                        debug_log.write(
+                            f"{tag}: removed {len(frames_removed)} frame(s) | eff_dur_part={eff_dur_part:.4f}s" +
+                            (f" | frames=" + ",".join(str(fr) for fr in frames_removed) if frames_removed else "") +
+                            "\n"
+                        )
+
         debug_log.write("===== SUMMARY END =====\n")
         debug_log.close()
 
     print(f"[✓] Movement data for {participant_id} appended to {OUT_CSV}.")
+    if args.parts and args.parts > 0:
+        print(f"[✓] Per-part (flattened) data appended to {OUT_PARTS_CSV}.")
     if args.debug:
         print(f"[ℹ] Summary log saved to: {debug_log_path}")
         if box_html_path:
