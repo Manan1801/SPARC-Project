@@ -2,12 +2,11 @@
 """
 landmark_xyz.py
 
-Convert 2D (pixel) hand landmarks to 3D (mm) for cam2 with depth aligned to color.
+Batch convert 2D (pixel) hand landmarks to 3D (mm) for cam2 with depth aligned to color.
+- Iterates numbered subfolders under a parent root (e.g., 01, 02, ...), or a single session root with cam2/.
 - Use COLOR intrinsics (fx, fy, cx, cy) from cam2/camera_intrinsics_*.json.
-- --debug flag: writes a concise END-OF-RUN SUMMARY (no anomalies section).
-- If the provided root contains numbered subfolders (01, 02, ...), the script
-       will automatically iterate through each and process their cam2/ folder.
-- --skip lets you skip specific numbered folders (e.g., --skip 03 07 or --skip 03,07).
+- --debug flag: writes a concise END-OF-RUN SUMMARY per session.
+- --skip to skip specific numbered folders (e.g., --skip 02 08 21 or --skip 02,08,21).
 
 Expected layout inside each numbered session folder:
   <PARENT_ROOT>/<NN>/
@@ -52,13 +51,36 @@ LANDMARK_IDS = [0, 1, 2, 3, 4]    # Thumb and Wrist only
 HANDS = ['L', 'R']
 
 
-def setup_logger(log_path: Path):
-    logging.basicConfig(
-        filename=str(log_path),
-        filemode='w',
-        level=logging.INFO,              # summary-only
-        format='%(message)s'
-    )
+# ── Minimal-change per-session logger helpers ────────────────────────────────
+def setup_logger(log_path: Path) -> logging.Logger:
+    """
+    Create an isolated, per-session logger that writes ONLY to log_path.
+    This replaces global basicConfig to avoid handler reuse across sessions.
+    """
+    logger_name = f"xyz.{log_path.stem}.{datetime.now().strftime('%H%M%S%f')}"
+    logger = logging.getLogger(logger_name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    # ensure clean handlers (paranoid)
+    for h in list(logger.handlers):
+        logger.removeHandler(h)
+        try:
+            h.close()
+        except Exception:
+            pass
+    fh = logging.FileHandler(str(log_path), mode='w')
+    fh.setFormatter(logging.Formatter('%(message)s'))
+    logger.addHandler(fh)
+    return logger
+
+
+def close_logger(logger: logging.Logger):
+    for h in list(logger.handlers):
+        try:
+            h.flush()
+            h.close()
+        finally:
+            logger.removeHandler(h)
 
 
 def find_cam2_paths(session_root: Path):
@@ -123,20 +145,23 @@ def process_cam2(session_root: Path, visualize: bool, debug: bool) -> bool:
     # Load COLOR intrinsics (depth is aligned to color)
     fx, fy, cx, cy, intr_file = load_color_intrinsics(cam2)
 
-    # Logger (same naming pattern retained)
+    # Per-session logger
+    logger = None
     log_path = None
     if debug:
         logs_dir.mkdir(parents=True, exist_ok=True)
         log_path = logs_dir / f"debug_xyz_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-        setup_logger(log_path)
-        logging.info(f"[Log Created] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        logging.info(f"Input CSV: {csv_path}")
+        logger = setup_logger(log_path)
+        logger.info(f"[Log Created] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"Input CSV: {csv_path}")
 
     # Read CSV
     try:
         df = pd.read_csv(csv_path)
     except Exception as e:
         print(f"[ERROR] {session_root.name}: Failed to read CSV: {e}")
+        if logger:
+            close_logger(logger)
         return True  # counted as processed attempt
 
     # Ensure numeric frame_id
@@ -315,8 +340,8 @@ def process_cam2(session_root: Path, visualize: bool, debug: bool) -> bool:
     else:
         print(f"[WARN] {session_root.name}: No valid data to write.")
 
-    # --------- Compact END-OF-RUN SUMMARY (no anomalies) ---------
-    if debug:
+    # --------- Compact END-OF-RUN SUMMARY (per-session) ---------
+    if logger:
         lines = []
         lines.append("=== XYZ Extraction Summary ===")
         lines.append(f"Session Root      : {session_root}")
@@ -362,7 +387,8 @@ def process_cam2(session_root: Path, visualize: bool, debug: bool) -> bool:
         else:
             lines.append("Landmark coverage : all selected landmarks look reasonably covered.")
 
-        logging.info("\n".join(lines))
+        logger.info("\n".join(lines))
+        close_logger(logger)
         print(f"[INFO] {session_root.name}: summary log written → {log_path}")
 
     return True
