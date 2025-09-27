@@ -191,18 +191,19 @@ def _wrap_label(s: str, width: int = 14) -> str:
 def save_grouped_bar_means_sem_pngs(X, labels, feature_names, out_prefix_path):
     """
     Grouped bar chart (single figure) with SEM error bars.
-    - Features shown in the same order as input CSV.
-    - Legend at top-right.
+    - X-axis: clusters (0..K-1)
+    - Bars: features (shown in the same order as input CSV)
+    - Legend: features (top-right)
     Saves: <out_prefix_path>.png
     Returns the saved file path.
     """
     X = np.asarray(X, float)
     labels = np.asarray(labels)
     clusters = np.unique(labels)
-    n_feat = len(feature_names)
     n_clust = len(clusters)
+    n_feat  = len(feature_names)
 
-    # Per-cluster stats
+    # Per-cluster stats (means and SEM for each feature)
     means = np.zeros((n_clust, n_feat))
     stds  = np.zeros((n_clust, n_feat))
     ns    = np.zeros(n_clust, dtype=int)
@@ -213,36 +214,55 @@ def save_grouped_bar_means_sem_pngs(X, labels, feature_names, out_prefix_path):
             means[i] = np.nanmean(sub, axis=0)
             stds[i]  = np.nanstd(sub, axis=0, ddof=1) if sub.shape[0] > 1 else 0.0
 
-    # SEM
     with np.errstate(divide='ignore', invalid='ignore'):
         sems = np.where(ns[:, None] > 0, stds / np.sqrt(ns[:, None]), 0.0)
 
-    # Single figure (no pagination)
-    x = np.arange(n_feat)
-    width = 0.8 / max(n_clust, 1)
+    # Single figure (no pagination). Now groups are clusters on the x-axis.
+    x = np.arange(n_clust)
+    # Width per feature inside each cluster group
+    width = 0.8 / max(n_feat, 1)
 
-    fig_w = max(9, min(26, 0.9 * n_feat + 4))
+    # Pick a colormap with enough distinct colors
+    colors = plt.cm.Paired(np.linspace(0, 1, n_feat))  # Paired distinct colors
+
+    # Wider figure when many features to avoid ultra-thin bars
+    fig_w = max(9, min(30, 0.35 * n_feat + 6))
     fig, ax = plt.subplots(figsize=(fig_w, 6))
 
-    for i, cl in enumerate(clusters):
-        ax.bar(x + i * width, means[i], width=width,
-               yerr=sems[i], capsize=4, linewidth=0.6, edgecolor="black",
-               alpha=0.9, label=f"Cluster {cl}")
+    # Draw one series per feature across clusters
+    for j in range(n_feat):
+        ax.bar(
+            x + j * width,             # shift inside the cluster group
+            means[:, j],               # values for each cluster
+            width=width,
+            yerr=sems[:, j],
+            capsize=4,
+            linewidth=0.6,
+            edgecolor="black",
+            alpha=0.9,
+            label=str(feature_names[j]),
+            color=colors[j % len(colors)]   # assign color
+        )
 
+    # Cosmetics
     ax.set_title("Per-Cluster Feature Averages (± 1 SEM)", pad=12)
     ax.set_ylabel("Mean (normalized)")
-    ax.set_xticks(x + width * (n_clust - 1) / 2)
-    ax.set_xticklabels([_wrap_label(s, width=14) for s in feature_names],
-                       rotation=25, ha="right")
+
+    # Center ticks under each cluster group
+    ax.set_xticks(x + width * (n_feat - 1) / 2)
+    # X-axis labels should be the cluster numbers
+    ax.set_xticklabels([str(int(c)) for c in clusters])
+
     ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
     ax.set_axisbelow(True)
-    ax.legend(title="Clusters", loc="upper right")
+    ax.legend(title="Features", loc="upper right", fontsize=7, title_fontsize=8)
     fig.tight_layout()
 
     out_path = f"{out_prefix_path}.png"
     fig.savefig(out_path, dpi=180)
     plt.close(fig)
     return out_path
+
 
 def main():
     args = parse_args()
