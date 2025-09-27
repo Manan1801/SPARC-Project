@@ -11,6 +11,7 @@ Generic cluster pipeline.
     * PCA scatter 2D → HTML
     * PCA scatter 3D → HTML
     * Silhouette samples plot → HTML
+    * Grouped bar (per-feature means ± SEM across clusters) → PNG (auto-paginated)
 - Report includes PCA loadings (PC1–PC3 when available) and explained variance.
 
 Usage:
@@ -34,6 +35,10 @@ from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 import plotly.express as px
 import plotly.graph_objects as go
+
+# NEW: small utilities (no new CLI args)
+import math
+import textwrap
 
 
 def parse_args():
@@ -161,6 +166,84 @@ def save_silhouette_samples_html(X, labels, pid, out_path):
     fig.write_html(str(out_path), include_plotlyjs="cdn")
 
 
+# ---------- CLEANER GROUPED BAR (no new args) ----------
+def _wrap_label(s: str, width: int = 14) -> str:
+    """
+    Wrap feature label to multiple lines for readability.
+    Prefers breaking on '_' when long.
+    """
+    if "_" in s and len(s) > width:
+        parts, lines, cur = s.split("_"), [], ""
+        for part in parts:
+            cand = (cur + "_" + part) if cur else part
+            if len(cand) <= width:
+                cur = cand
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = part
+        if cur:
+            lines.append(cur)
+        return "\n".join(lines)
+    return "\n".join(textwrap.wrap(s, width=width)) if len(s) > width else s
+
+
+def save_grouped_bar_means_sem_pngs(X, labels, feature_names, out_prefix_path):
+    """
+    Grouped bar chart (single figure) with SEM error bars.
+    - Features shown in the same order as input CSV.
+    - Legend at top-right.
+    Saves: <out_prefix_path>.png
+    Returns the saved file path.
+    """
+    X = np.asarray(X, float)
+    labels = np.asarray(labels)
+    clusters = np.unique(labels)
+    n_feat = len(feature_names)
+    n_clust = len(clusters)
+
+    # Per-cluster stats
+    means = np.zeros((n_clust, n_feat))
+    stds  = np.zeros((n_clust, n_feat))
+    ns    = np.zeros(n_clust, dtype=int)
+    for i, cl in enumerate(clusters):
+        sub = X[labels == cl]
+        ns[i] = sub.shape[0]
+        if sub.size:
+            means[i] = np.nanmean(sub, axis=0)
+            stds[i]  = np.nanstd(sub, axis=0, ddof=1) if sub.shape[0] > 1 else 0.0
+
+    # SEM
+    with np.errstate(divide='ignore', invalid='ignore'):
+        sems = np.where(ns[:, None] > 0, stds / np.sqrt(ns[:, None]), 0.0)
+
+    # Single figure (no pagination)
+    x = np.arange(n_feat)
+    width = 0.8 / max(n_clust, 1)
+
+    fig_w = max(9, min(26, 0.9 * n_feat + 4))
+    fig, ax = plt.subplots(figsize=(fig_w, 6))
+
+    for i, cl in enumerate(clusters):
+        ax.bar(x + i * width, means[i], width=width,
+               yerr=sems[i], capsize=4, linewidth=0.6, edgecolor="black",
+               alpha=0.9, label=f"Cluster {cl}")
+
+    ax.set_title("Per-Cluster Feature Averages (± 1 SEM)", pad=12)
+    ax.set_ylabel("Mean (normalized)")
+    ax.set_xticks(x + width * (n_clust - 1) / 2)
+    ax.set_xticklabels([_wrap_label(s, width=14) for s in feature_names],
+                       rotation=25, ha="right")
+    ax.grid(axis="y", linestyle="--", linewidth=0.5, alpha=0.6)
+    ax.set_axisbelow(True)
+    ax.legend(title="Clusters", loc="upper right")
+    fig.tight_layout()
+
+    out_path = f"{out_prefix_path}.png"
+    fig.savefig(out_path, dpi=180)
+    plt.close(fig)
+    return out_path
+
 def main():
     args = parse_args()
     in_path = Path(args.csv).expanduser().resolve()
@@ -202,6 +285,10 @@ def main():
     sil_samples_html = out_dir / f"silhouette_samples_k{k_final}_{ts}.html"
     save_silhouette_samples_html(X, labels_final, pid, sil_samples_html)
 
+    # ------ grouped bar (SEM, input order, single figure) ------
+    grouped_prefix = str(out_dir / f"grouped_bar_means_sem_k{k_final}_{ts}")
+    grouped_bar_png = save_grouped_bar_means_sem_pngs(X, labels_final, used_feature_cols, grouped_prefix)
+
     # ---------- Save assignments ----------
     cluster_csv = out_dir / f"cluster_assignments_k{k_final}_{ts}.csv"
     pd.DataFrame({id_col: pid, "cluster": labels_final}).to_csv(cluster_csv, index=False)
@@ -217,15 +304,6 @@ def main():
         ""
     ]
 
-    explained2 = getattr(pca2, "explained_variance_ratio_", None)
-    comps2 = getattr(pca2, "components_", None)
-    if explained2 is not None and comps2 is not None:
-        report_lines.append("PCA 2D loadings (PC1–PC2):")
-        for i, (vec, var) in enumerate(zip(comps2, explained2), start=1):
-            report_lines.append(f"  PC{i} (var={var:.4f}):")
-            report_lines.extend([f"    - {f}: {val:.5f}" for f, val in zip(used_feature_cols, vec)])
-        report_lines.append("")
-
     explained3 = getattr(pca3, "explained_variance_ratio_", None)
     comps3 = getattr(pca3, "components_", None)
     if explained3 is not None and comps3 is not None:
@@ -236,13 +314,14 @@ def main():
         report_lines.append("")
 
     report_lines += [
-        "Artifacts:",
-        f" - Normalized CSV           : {norm_csv.name}",
-        f" - Silhouette vs Inertia PNG: {sil_inertia_png.name}",
-        f" - PCA scatter 2D HTML      : {pca2d_html.name}",
-        f" - PCA scatter 3D HTML      : {pca3d_html.name}",
-        f" - Silhouette samples HTML  : {sil_samples_html.name}",
-        f" - Cluster assignments CSV  : {cluster_csv.name}"
+    "Artifacts:",
+    f" - Normalized CSV              : {norm_csv.name}",
+    f" - Silhouette vs Inertia PNG   : {sil_inertia_png.name}",
+    f" - PCA scatter 2D HTML         : {pca2d_html.name}",
+    f" - PCA scatter 3D HTML         : {pca3d_html.name}",
+    f" - Silhouette samples HTML     : {sil_samples_html.name}",
+    f" - Grouped bar PNG             : {Path(grouped_bar_png).name}",
+    f" - Cluster assignments CSV     : {cluster_csv.name}"
     ]
 
     report_txt = out_dir / f"clustering_report_{ts}.txt"
