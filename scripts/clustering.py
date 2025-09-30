@@ -112,12 +112,35 @@ def save_pca_scatter_2d_html(X, labels, pid, out_path):
         "Cluster": labels,
         "Participant ID": pid
     })
+
+    # ---- CHANGE THIS VALUE to adjust scatter size ----
+    point_size = 40   # matplotlib uses "area" of marker, default ~40
+    # --------------------------------------------------
+
+    # Plotly interactive version
     fig = px.scatter(
         df_plot, x="PC1", y="PC2", color=df_plot["Cluster"].astype(str),
         hover_data={"Participant ID": True, "Cluster": True},
         title="PCA(2D) Scatter", template="plotly_white"
     )
+    fig.update_traces(marker=dict(size=point_size // 5))  # adjust for Plotly
     fig.write_html(str(out_path), include_plotlyjs="cdn")
+
+    # Matplotlib static PNG
+    png_path = str(out_path).replace(".html", ".png")
+    plt.figure(figsize=(7, 5))
+    for cl in sorted(df_plot["Cluster"].unique()):
+        sub = df_plot[df_plot["Cluster"] == cl]
+        plt.scatter(sub["PC1"], sub["PC2"], s=point_size, label=f"Cluster {cl}", alpha=0.8, edgecolor="k")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.title("PCA(2D) Scatter")
+    plt.legend(title="Cluster")
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(png_path, dpi=180)
+    plt.close()
+
     return pca2
 
 
