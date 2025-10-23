@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_rt_pipeline.sh — Interactive wrapper for realtime_capture.py
+# realtime.sh — Interactive wrapper for realtime_capture.py (movement + emotion)
 
 set -euo pipefail
 
@@ -63,12 +63,13 @@ ask_choice() {
 cat <<'BANNER'
 ────────────────────────────────────────────────────────────────
    Real-Time Unified Pipeline — Interactive Launcher
-   (captures all cams; optionally process selected cams)
+   (captures all cams; selectively process Movement and/or Emotion)
 ────────────────────────────────────────────────────────────────
 Controls during run:
   • Pause/Resume : SPACE
+  • Close grid   : q     (pipeline continues)
+  • Reopen grid  : g     (press in terminal)
   • Stop         : ESC or Ctrl+C
-(Advanced: you can still send SIGUSR1/SIGUSR2 if needed.)
 ────────────────────────────────────────────────────────────────
 BANNER
 
@@ -76,31 +77,51 @@ OUTPUT_DIR="$(ask "Output directory" "./run_$(date +%Y%m%d_%H%M%S)")"
 DUR_SEC="$(ask "Active recording duration in seconds" "60")"
 
 echo
-echo "Which camera(s) to PROCESS (capture still happens for all)"
+echo "Which camera(s) to PROCESS for MOVEMENT?"
 echo "  - Enter comma-separated labels (e.g., cam2 or cam1,cam3)"
 echo "  - Enter 'all' to process all"
-echo "  - Enter 'none' for capture-only (no RT processing)"
-PROC_INPUT="$(ask "Process cams" "cam2")"
+echo "  - Enter 'none' for capture-only (no RT movement)"
+PROC_MOV_INPUT="$(ask "Movement cams" "cam2")"
 
-declare -a PROC_CAMS_ARR=()
-PROC_MODE="some"
-case "${PROC_INPUT,,}" in
-  ""|"all") PROC_MODE="all" ;;
-  "none")   PROC_MODE="none" ;;
+declare -a PROC_MOV_ARR=()
+PROC_MOV_MODE="some"
+case "${PROC_MOV_INPUT,,}" in
+  ""|"all") PROC_MOV_MODE="all" ;;
+  "none")   PROC_MOV_MODE="none" ;;
   *)
-    IFS=',' read -r -a rawcams <<< "$PROC_INPUT"
+    IFS=',' read -r -a rawcams <<< "$PROC_MOV_INPUT"
     for c in "${rawcams[@]}"; do
       c_trim="$(echo "$c" | xargs)"
-      [[ -n "$c_trim" ]] && PROC_CAMS_ARR+=("$c_trim")
+      [[ -n "$c_trim" ]] && PROC_MOV_ARR+=("$c_trim")
     done
-    if [[ "${#PROC_CAMS_ARR[@]}" -eq 0 ]]; then PROC_MODE="all"; fi
+    if [[ "${#PROC_MOV_ARR[@]}" -eq 0 ]]; then PROC_MOV_MODE="all"; fi
+    ;;
+esac
+
+echo
+echo "Which camera(s) to PROCESS for EMOTION (valence/arousal)?"
+echo "  - Enter comma-separated labels (e.g., cam3 or cam1,cam2)"
+echo "  - Enter 'none' to disable emotion processing"
+PROC_EMO_INPUT="$(ask "Emotion cams" "none")"
+
+declare -a PROC_EMO_ARR=()
+PROC_EMO_MODE="some"
+case "${PROC_EMO_INPUT,,}" in
+  ""|"none") PROC_EMO_MODE="none" ;;
+  *)
+    IFS=',' read -r -a rawemo <<< "$PROC_EMO_INPUT"
+    for c in "${rawemo[@]}"; do
+      c_trim="$(echo "$c" | xargs)"
+      [[ -n "$c_trim" ]] && PROC_EMO_ARR+=("$c_trim")
+    done
+    if [[ "${#PROC_EMO_ARR[@]}" -eq 0 ]]; then PROC_EMO_MODE="none"; fi
     ;;
 esac
 
 SAVE_EVERY="$(ask "Save raw frames? Enter N (save every Nth frame; 0 = OFF)" "1")"
 FILTERS="$(ask_choice "Depth filters" "on|off" "off")"
-VIZ_LIVE="$(ask_choice "Live preview window" "off|window" "off")"
-FORCE_FLIP="$(ask_choice "Handedness flip baseline" "flip|same" "flip")"
+VIZ_LIVE="$(ask_choice "Live preview window (unified 2x2 grid)" "off|window" "off")"
+FORCE_FLIP="$(ask_choice "Handedness flip baseline (movement)" "flip|same" "flip")"
 
 AUDIO_ENABLE="$(ask_yn "Record microphones too?" "n")"
 if [[ "$AUDIO_ENABLE" == "y" ]]; then
@@ -111,29 +132,39 @@ fi
 
 ADVANCED="$(ask_yn "Enter Advanced Controls?" "n")"
 
+# Movement advanced defaults
 STRIDE="1"
 BKP_POLICY="drop-latest"
 VIZ_SAVE_EVERY="3"
 CSV_FLUSH="30"
 LOG_FLUSH_SEC="5"
-HEALTH_SEC="5"
+
+# Emotion advanced defaults
+EMO_HISTORY="240"
+EMO_STRIDE="1"
+EMO_CSV_FLUSH="30"
+
 AUDIO_OUT="$OUTPUT_DIR/audio"
 AUDIO_DUR="$DUR_SEC"
 
 if [[ "$ADVANCED" == "y" ]]; then
   echo
-  echo "── Advanced Controls ──────────────────────────────"
-  STRIDE="$(ask "Processing stride (process every Nth frame)" "1")"
+  echo "── Advanced Controls (Movement) ──────────────"
+  STRIDE="$(ask "Movement processing stride (every Nth frame)" "1")"
   BKP_POLICY="$(ask_choice "Frame backpressure policy" "drop-latest|block" "drop-latest")"
-  VIZ_SAVE_EVERY="$(ask "Save annotated previews every N frames (0 = OFF)" "3")"
-  CSV_FLUSH="$(ask "CSV flush interval (frames)" "30")"
+  VIZ_SAVE_EVERY="$(ask "Save annotated movement previews every N frames (0 = OFF)" "3")"
+  CSV_FLUSH="$(ask "Movement CSV flush interval (frames)" "30")"
   LOG_FLUSH_SEC="$(ask "Logger flush interval (seconds)" "5")"
-  HEALTH_SEC="$(ask "Health/telemetry interval (seconds)" "5")"
+  echo "── Advanced Controls (Emotion) ───────────────"
+  EMO_HISTORY="$(ask "Emotion plot history length (frames)" "240")"
+  EMO_STRIDE="$(ask "Emotion processing stride (every Nth frame)" "1")"
+  EMO_CSV_FLUSH="$(ask "Emotion CSV flush interval (frames)" "30")"
   if [[ "$AUDIO_ENABLE" == "y" ]]; then
+    echo "── Advanced Controls (Audio) ─────────────────"
     AUDIO_OUT="$(ask "Audio output directory" "$AUDIO_OUT")"
     AUDIO_DUR="$(ask "Audio active duration in seconds" "$AUDIO_DUR")"
   fi
-  echo "───────────────────────────────────────────────────"
+  echo "──────────────────────────────────────────────"
 fi
 
 declare -a CMD
@@ -149,15 +180,29 @@ CMD+=("--backpressure" "$BKP_POLICY")
 CMD+=("--viz-save-every" "$VIZ_SAVE_EVERY")
 CMD+=("--csv-flush" "$CSV_FLUSH")
 CMD+=("--log-flush-sec" "$LOG_FLUSH_SEC")
-CMD+=("--health-interval-sec" "$HEALTH_SEC")
 
-if [[ "$PROC_MODE" == "none" ]]; then
-  CMD+=("--process-cams")
-elif [[ "$PROC_MODE" == "some" ]]; then
-  CMD+=("--process-cams")
-  for lab in "${PROC_CAMS_ARR[@]}"; do CMD+=("$lab"); done
+# Movement cams:
+if [[ "$PROC_MOV_MODE" == "none" ]]; then
+  CMD+=("--process-mov-cams")
+elif [[ "$PROC_MOV_MODE" == "some" ]]; then
+  CMD+=("--process-mov-cams")
+  for lab in "${PROC_MOV_ARR[@]}"; do CMD+=("$lab"); done
 fi
+# If PROC_MOV_MODE == "all", omit the flag (Python defaults to ALL)
 
+# Emotion cams:
+if [[ "$PROC_EMO_MODE" == "some" ]]; then
+  CMD+=("--process-emo-cams")
+  for lab in "${PROC_EMO_ARR[@]}"; do CMD+=("$lab"); done
+fi
+# If PROC_EMO_MODE == "none", omit the flag (Python defaults to NONE for emotion)
+
+# Emotion tunables
+CMD+=("--emo-history" "$EMO_HISTORY")
+CMD+=("--emo-stride" "$EMO_STRIDE")
+CMD+=("--emo-csv-flush" "$EMO_CSV_FLUSH")
+
+# Audio
 if [[ "$AUDIO_ENABLE" == "y" ]]; then
   CMD+=("--audio-out" "$AUDIO_OUT")
   CMD+=("--audio-duration-sec" "$AUDIO_DUR")
@@ -168,27 +213,33 @@ fi
 
 echo
 echo "──────────────── RUN SUMMARY ────────────────"
-echo "Output dir         : $OUTPUT_DIR"
-echo "Duration (sec)     : $DUR_SEC"
-echo "Process cams       : ${PROC_MODE^^}"
-if [[ "$PROC_MODE" == "some" ]]; then
-  echo "  • Labels         : ${PROC_CAMS_ARR[*]}"
+echo "Output dir              : $OUTPUT_DIR"
+echo "Duration (sec)          : $DUR_SEC"
+echo "Movement cams           : ${PROC_MOV_MODE^^}"
+if [[ "$PROC_MOV_MODE" == "some" ]]; then
+  echo "  • Labels              : ${PROC_MOV_ARR[*]}"
 fi
-echo "Save-every (raw)   : $SAVE_EVERY"
-echo "Depth filters      : $FILTERS"
-echo "Live preview       : $VIZ_LIVE"
-echo "Force flip         : $FORCE_FLIP"
-echo "Stride             : $STRIDE"
-echo "Backpressure       : $BKP_POLICY"
-echo "Viz save-every     : $VIZ_SAVE_EVERY"
-echo "CSV flush (frames) : $CSV_FLUSH"
-echo "Log flush (sec)    : $LOG_FLUSH_SEC"
-echo "Health interval    : $HEALTH_SEC"
-echo "Audio enabled      : $([[ "$AUDIO_ENABLE" == "y" ]] && echo "yes" || echo "no")"
+echo "Emotion cams            : ${PROC_EMO_MODE^^}"
+if [[ "$PROC_EMO_MODE" == "some" ]]; then
+  echo "  • Labels              : ${PROC_EMO_ARR[*]}"
+fi
+echo "Save-every (raw)        : $SAVE_EVERY"
+echo "Depth filters           : $FILTERS"
+echo "Live preview            : $VIZ_LIVE"
+echo "Force flip (movement)   : $FORCE_FLIP"
+echo "Stride (movement)       : $STRIDE"
+echo "Backpressure            : $BKP_POLICY"
+echo "Viz save-every (move)   : $VIZ_SAVE_EVERY"
+echo "CSV flush (move)        : $CSV_FLUSH"
+echo "Log flush (sec)         : $LOG_FLUSH_SEC"
+echo "Emotion history (frames): $EMO_HISTORY"
+echo "Emotion stride          : $EMO_STRIDE"
+echo "Emotion CSV flush       : $EMO_CSV_FLUSH"
+echo "Audio enabled           : $([[ "$AUDIO_ENABLE" == "y" ]] && echo "yes" || echo "no")"
 if [[ "$AUDIO_ENABLE" == "y" ]]; then
-  echo "  • Rate (Hz)      : $RATE"
-  echo "  • Audio out      : $AUDIO_OUT"
-  echo "  • Audio dur (s)  : $AUDIO_DUR"
+  echo "  • Rate (Hz)           : $RATE"
+  echo "  • Audio out           : $AUDIO_OUT"
+  echo "  • Audio dur (s)       : $AUDIO_DUR"
 fi
 echo "─────────────────────────────────────────────"
 echo "Command to run:"
