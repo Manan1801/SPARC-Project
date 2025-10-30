@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-# preview_grid.py (final polish)
+# preview_grid.py — robust UI loop & clean shutdown + centralized logging
 import time
+import sys
 from collections import deque
+from pathlib import Path
 import numpy as np
 import cv2
 from tunables import DEFAULT_CELL_W, DEFAULT_CELL_H, PLOT_UPDATE_INTERVAL
+from logger_utils import DebouncedLogger, get_preview_logger
 
 class PreviewGrid:
-    def __init__(self, title="Unified Preview", history_len=600, target_fps=30):
+    def __init__(self, title="Unified Preview", history_len=600, target_fps=30, logger: DebouncedLogger | None = None,
+                 total_duration_sec: float | None = None):
         self.title = title
         self.history_len = int(max(120, history_len))
         self.target_dt = 1.0 / float(max(5, target_fps))
@@ -19,143 +23,371 @@ class PreviewGrid:
         self.cell_h, self.cell_w = DEFAULT_CELL_H, DEFAULT_CELL_W
         self.hand_frame = None
         self.emo_frame = None
-        self.r0_cum_hist = deque(maxlen=self.history_len)
+
+        # Movement (cumulative) history + timestamps
+        self.r0_cum_hist = deque(maxlen=self.history_len)     # floats
+        self.r0_time_hist = deque(maxlen=self.history_len)    # float monotonic timestamps
+        self._t0_plot = None                                  # first timestamp
         self.r0_last_avg_speed = 0.0
+
+        # Affect history
         self.va_hist = deque(maxlen=self.history_len)
+
+        self.logger = logger or get_preview_logger(Path("."))
+
+        # Total duration to lock X-axis (auto-read from argv so you don't change other scripts)
+        self.total_duration_sec = self._guess_total_duration_from_argv() if total_duration_sec is None else float(max(1.0, total_duration_sec))
+
+        # Short-lived badges and persistent event marks (absolute times, keep text for color parity)
+        self._active_events = []   # {"text": str, "kind": str, "expires": float}
+        self._event_marks = []     # {"t_abs": float, "kind": str, "text": str}
+
+    def _guess_total_duration_from_argv(self, default: float = 60.0) -> float:
+        try:
+            args = sys.argv
+            if "--duration-sec" in args:
+                i = args.index("--duration-sec")
+                if i + 1 < len(args):
+                    return float(args[i + 1])
+        except Exception:
+            pass
+        return float(default)
 
     # ---------- external ----------
     def start(self):
         if self._thread: return
         self._run_flag.set(); self._is_open.set()
         import threading
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread = threading.Thread(target=self._loop, daemon=True, name="preview-grid")
         self._thread.start()
+        try: self.logger.info("Preview window started")
+        finally: self.logger.periodic_flush()
 
-    def reopen_window(self): self._is_open.set()
+    def reopen_window(self):
+        self._is_open.set()
+        try: self.logger.info("Preview window reopened")
+        finally: self.logger.periodic_flush()
+
     def close_window(self):
         self._is_open.clear()
-        try: cv2.destroyWindow(self.title)
-        except: pass
+        try:
+            cv2.destroyWindow(self.title)
+        except Exception:
+            pass
+        try: self.logger.info("Preview window closed")
+        finally: self.logger.periodic_flush()
+
     def stop(self):
         self._run_flag.clear(); self._is_open.clear()
-        try: cv2.destroyWindow(self.title)
-        except: pass
+        try:
+            cv2.destroyWindow(self.title)
+        except Exception:
+            pass
+        if self._thread and self._thread.is_alive():
+            try:
+                self._thread.join(timeout=1.0)
+            except Exception:
+                pass
+        self._thread = None
+        try: self.logger.info("Preview window stopped")
+        finally: self.logger.periodic_flush(force=True)
 
-    def update_hand_frame(self, img): 
-        with self.lock: self.hand_frame = img.copy(); self._maybe_set_cell_size(img)
+    # optional setter (not required by launcher)
+    def set_total_duration(self, duration_sec: float):
+        with self.lock:
+            self.total_duration_sec = float(max(1.0, duration_sec))
+
+    def update_hand_frame(self, img):
+        with self.lock:
+            self.hand_frame = img.copy()
+            self._maybe_set_cell_size(img)
+
     def update_emo_frame(self, img):
-        with self.lock: self.emo_frame = img.copy(); self._maybe_set_cell_size(img)
+        with self.lock:
+            self.emo_frame = img.copy()
+            self._maybe_set_cell_size(img)
+
     def push_r0_cumulative(self, cum, avg):
-        with self.lock: self.r0_cum_hist.append(float(cum)); self.r0_last_avg_speed = float(avg)
+        now = time.monotonic()
+        with self.lock:
+            if self._t0_plot is None:
+                self._t0_plot = now
+            self.r0_cum_hist.append(float(cum))
+            self.r0_time_hist.append(now)
+            self.r0_last_avg_speed = float(avg)
+
     def push_valence_arousal(self, val, aro):
-        with self.lock: self.va_hist.append((float(val), float(aro)))
+        with self.lock:
+            self.va_hist.append((float(val), float(aro)))
+
+    # --- event overlays + persistent marks ---
+    def annotate_event(self, cam_label: str, kind: str, text: str, ttl_s: float = 6.0):
+        now = time.monotonic()
+        exp = now + max(0.5, float(ttl_s))
+        with self.lock:
+            self._active_events = [e for e in self._active_events if e["expires"] > now]
+            self._active_events.append({"text": str(text), "kind": str(kind), "expires": exp})
+            # keep text so marker color matches badge wording
+            self._event_marks.append({"t_abs": now, "kind": str(kind), "text": str(text)})
 
     def _maybe_set_cell_size(self, img):
         h, w = img.shape[:2]
         maxw = 640
-        scale = min(1.0, maxw / float(w)) if w>0 else 1.0
-        self.cell_w, self.cell_h = int(w*scale), int(h*scale)
+        scale = min(1.0, maxw / float(w)) if w > 0 else 1.0
+        self.cell_w, self.cell_h = int(w * scale), int(h * scale)
 
     # ---------- badges ----------
     def _badge(self, img, text, corner="tl", pad=8, opacity=0.4):
-        """Rounded badge, larger spacing to avoid overlay collision"""
-        (tw, th), base = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
         bw, bh = tw + 18, th + 14
         H, W = img.shape[:2]
-        if corner=="tl": x0,y0=pad, pad
-        elif corner=="tr": x0,y0=W-bw-pad, pad
-        elif corner=="bl": x0,y0=pad,H-bh-pad
-        else: x0,y0=W-bw-pad,H-bh-pad
+        if corner == "tl": x0, y0 = pad, pad
+        elif corner == "tr": x0, y0 = W - bw - pad, pad
+        elif corner == "bl": x0, y0 = pad, H - bh - pad
+        else: x0, y0 = W - bw - pad, H - bh - pad
         overlay = img.copy()
-        cv2.rectangle(overlay,(x0,y0),(x0+bw,y0+bh),(0,0,0),-1)
-        cv2.addWeighted(overlay, opacity, img, 1-opacity, 0, img)
-        cv2.rectangle(img,(x0,y0),(x0+bw,y0+bh),(180,180,180),1)
-        cv2.putText(img,text,(x0+9,y0+bh-5),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),1,cv2.LINE_AA)
+        cv2.rectangle(overlay, (x0, y0), (x0 + bw, y0 + bh), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, opacity, img, 1 - opacity, 0, img)
+        cv2.rectangle(img, (x0, y0), (x0 + bw, y0 + bh), (180, 180, 180), 1)
+        cv2.putText(img, text, (x0 + 9, y0 + bh - 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
         return img
 
     # ---------- cumulative plot ----------
-    def _render_plot_line(self, values, label, avg_speed=0.0, center_tip=True):
-        W,H=self.cell_w,self.cell_h
-        canvas=np.zeros((H,W,3),np.uint8)
-        x0,y0,x1,y1=46,28,W-26,H-46
-        width,height=max(1,x1-x0),max(1,y1-y0)
-        cv2.rectangle(canvas,(x0,y0),(x1,y1),(80,80,80),1)
-        self._badge(canvas,label,"tl")
-        if not values: return canvas
-        v_tip=float(values[-1])
-        ymin=min(values); ymax=max(values)
-        half=max(abs(v_tip-ymin),abs(v_tip-ymax))*1.1
-        half=max(half,1e-3); ymin=v_tip-half; ymax=v_tip+half
-        def vy(v): return int(y1-(v-ymin)/(ymax-ymin)*(y1-y0))
-        n=len(values); cx=x0+width//2
-        pts=[]
-        for i,v in enumerate(values):
-            frac=i/(n-1) if n>1 else 0
-            x=int(x0+frac*(cx-x0)) if center_tip else int(x0+frac*(x1-x0))
-            pts.append((x,vy(v)))
-        if center_tip: cv2.line(canvas,(cx,y0),(cx,y1),(64,64,64),1)
-        for i in range(1,len(pts)): cv2.line(canvas,pts[i-1],pts[i],(0,255,255),2)
-        tip=pts[-1]
-        cv2.circle(canvas,tip,3,(255,255,255),-1)
-        # Tip text restored
-        txt=f"{v_tip:.1f} mm | avg:{avg_speed:.2f} mm/s"
-        cv2.putText(canvas,txt,(tip[0]+10,tip[1]-6),cv2.FONT_HERSHEY_SIMPLEX,0.55,(255,255,255),1,cv2.LINE_AA)
+    def _render_plot_line(self, values, label, avg_speed=0.0):
+        """
+        • Uses real timestamps to compute elapsed (no drift).
+        • Tip glides from (mid-x, 80% y) → (right-x, 100% y) over total duration.
+        • X ticks: [0, now, total]. Y ticks: [0, current].
+        • Event marks: triangles ON the curve (▲ red high, ▼ cyan low), color keyed by text.
+        • Y-scale is solved so CURRENT VALUE maps exactly to target Y (≥80%).
+        """
+        W, H = self.cell_w, self.cell_h
+        canvas = np.zeros((H, W, 3), np.uint8)
+
+        x0, y0, x1, y1 = 60, 30, W - 30, H - 50
+        width, height = max(1, x1 - x0), max(1, y1 - y0)
+        cx = x0 + width // 2
+
+        # frame + axes
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (80, 80, 80), 1)
+        cv2.line(canvas, (x0, y1), (x1, y1), (100, 100, 100), 1)    # X
+        cv2.line(canvas, (x0, y0), (x0, y1), (100, 100, 100), 1)    # Y
+        self._badge(canvas, label, "tr")
+
+        vals = list(values)
+        times = list(self.r0_time_hist)
+        if not vals:
+            return canvas
+
+        # make sure arrays align and start at 0 at t=0
+        if times and len(vals) > len(times):
+            vals = vals[-len(times):]
+        if len(times) > len(vals):
+            times = times[-len(vals):]
+
+        if vals and vals[0] != 0.0:
+            # prepend a zero sample aligned with first time (keeps curve anchored)
+            vals = [0.0] + vals
+            if times:
+                times = [times[0]] + times
+
+        # elapsed (true seconds), clamped to total
+        if self._t0_plot is None:
+            self._t0_plot = times[0] if times else time.monotonic()
+        t0 = self._t0_plot
+        t_last = times[-1] if times else t0
+        elapsed = max(0.0, t_last - t0)
+        total_T = max(1e-9, self.total_duration_sec)
+        elapsed = min(elapsed, total_T)
+
+        # tip x from mid → right
+        x_tip = int(cx + (elapsed / total_T) * (x1 - cx))
+
+        # strict Y-scale: current maps to target_y (0.8→1.0 over time)
+        current = float(vals[-1])
+        target_ratio_y = 0.8 + 0.2 * (elapsed / total_T)
+        target_ratio_y = float(np.clip(target_ratio_y, 0.8, 1.0))
+        eps = 1e-6
+        if current <= eps:
+            y_max = 1.0  # avoid div-by-zero; flat zero stays on baseline
+        else:
+            y_max = max(current / target_ratio_y, eps)
+
+        def map_y(v: float) -> int:
+            clamped = np.clip(v / y_max, 0.0, 1.0)
+            return int(y1 - clamped * height)
+
+        # map x using real times: [0..elapsed] -> [x0..x_tip]
+        def map_x_t(t_sec: float) -> int:
+            if elapsed <= 1e-9:
+                return x_tip
+            frac = np.clip(t_sec / elapsed, 0.0, 1.0)
+            return int(x0 + frac * (x_tip - x0))
+
+        # draw curve
+        prev = None
+        for v, t_abs in zip(vals, times):
+            t_rel = max(0.0, t_abs - t0)
+            x = map_x_t(t_rel)
+            y = map_y(v)
+            if prev is not None:
+                cv2.line(canvas, prev, (x, y), (0, 255, 255), 2)
+            prev = (x, y)
+
+        # tip + avg text
+        tip_y = map_y(current)
+        cv2.circle(canvas, (x_tip, tip_y), 3, (255, 255, 255), -1)
+        cv2.putText(canvas, f"avg:{avg_speed:.2f} mm/s", (x_tip + 10, tip_y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+        # X ticks: [0, now, total]
+        tick_y = y1 + 18
+        for t_val, label_txt in ((0.0, "0"), (elapsed, f"{elapsed:.0f}s"), (total_T, f"{total_T:.0f}s")):
+            if t_val <= elapsed:
+                x_tick = map_x_t(t_val)
+            else:
+                rem = (t_val - elapsed) / max(1e-9, (total_T - elapsed))
+                x_tick = int(x_tip + rem * (x1 - x_tip))
+            x_tick = int(np.clip(x_tick, x0, x1))
+            cv2.line(canvas, (x_tick, y1), (x_tick, y1 + 6), (130, 130, 130), 1)
+            cv2.putText(canvas, label_txt, (x_tick - 10, tick_y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+        # Y ticks: [0, current]
+        for v_val, label_txt in ((0.0, "0"), (current, f"{current:.0f}")):
+            y = map_y(v_val)
+            cv2.line(canvas, (x0 - 6, y), (x0, y), (130, 130, 130), 1)
+            cv2.putText(canvas, label_txt, (x0 - 50, y + 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+        # Event triangles on the curve; color keyed by TEXT (matches badge)
+        with self.lock:
+            marks = list(self._event_marks)
+        tri = 7
+        for m in marks:
+            # event time relative to t0, clamped to drawn window
+            t_e = float(np.clip(m["t_abs"] - t0, 0.0, elapsed))
+            # locate closest sample
+            if times:
+                # pick index by nearest time
+                diffs = np.abs(np.array(times) - (t0 + t_e))
+                idx = int(np.argmin(diffs))
+                v_e = float(vals[idx])
+            else:
+                idx = 0; v_e = current
+            mx = map_x_t(t_e)
+            my = map_y(v_e)
+            txt = m.get("text", "")
+            if "high" in txt.lower():
+                pts = np.array([[mx, my - tri], [mx - tri, my + tri], [mx + tri, my + tri]], np.int32)  # ▲
+                color = (0, 0, 255)  # red
+            else:
+                pts = np.array([[mx, my + tri], [mx - tri, my - tri], [mx + tri, my - tri]], np.int32)  # ▼
+                color = (255, 255, 0)  # cyan
+            cv2.fillConvexPoly(canvas, pts, color)
+
         return canvas
 
     # ---------- valence/arousal ----------
     def _render_va(self, tuples_va):
-        W,H=self.cell_w,self.cell_h
-        canvas=np.zeros((H,W,3),np.uint8)
-        x0,y0,x1,y1=46,28,W-26,H-46
-        cv2.rectangle(canvas,(x0,y0),(x1,y1),(80,80,80),1)
-        self._badge(canvas,"Valence (Green)  Arousal (Orange)","tr")
-        if not tuples_va: return canvas
-        def vy_val(v): return int(y1-(v+1)/2*(y1-y0))
-        def vy_aro(a): return int(y1-(a)*(y1-y0))
-        prev_v=prev_a=None
-        n=len(tuples_va)
-        for i,(v,a) in enumerate(tuples_va):
-            x=x0+int(i*(x1-x0-1)/(n-1))
-            yv,ya=vy_val(v),vy_aro(a)
-            if prev_v: cv2.line(canvas,prev_v,(x,yv),(0,255,0),2)
-            if prev_a: cv2.line(canvas,prev_a,(x,ya),(0,165,255),2)
-            prev_v,prev_a=(x,yv),(x,ya)
+        W, H = self.cell_w, self.cell_h
+        canvas = np.zeros((H, W, 3), np.uint8)
+        x0, y0, x1, y1 = 60, 30, W - 30, H - 50
+        cv2.rectangle(canvas, (x0, y0), (x1, y1), (80, 80, 80), 1)
+        cv2.line(canvas, (x0, y1), (x1, y1), (100, 100, 100), 1)
+        cv2.line(canvas, (x0, y0), (x0, y1), (100, 100, 100), 1)
+        self._badge(canvas, "Valence (Green)  Arousal (Orange)", "tr")
+        if not tuples_va:
+            return canvas
+
+        def vx(i, n):
+            den = max(1, n - 1)
+            return x0 + int(i * (x1 - x0 - 1) / den)
+        def vy_val(v):
+            return int(y1 - ((v + 1.0) * 0.5) * (y1 - y0))
+        def vy_aro(a):
+            return int(y1 - (a) * (y1 - y0))
+
+        prev_v = prev_a = None
+        n = len(tuples_va)
+        for i, (v, a) in enumerate(tuples_va):
+            x = vx(i, n)
+            yv, ya = vy_val(v), vy_aro(a)
+            if prev_v: cv2.line(canvas, prev_v, (x, yv), (0, 255, 0), 2)
+            if prev_a: cv2.line(canvas, prev_a, (x, ya), (0, 165, 255), 2)
+            prev_v, prev_a = (x, yv), (x, ya)
         return canvas
 
     # ---------- compose ----------
     def _compose_grid(self, hand, emo, mov_plot, va_plot):
         def fit(img):
-            if img is None: return np.zeros((self.cell_h,self.cell_w,3),np.uint8)
-            return cv2.resize(img,(self.cell_w,self.cell_h))
-        tl, tr, bl, br = map(fit,(hand,emo,mov_plot,va_plot))
-        # badges positioned to avoid overlap
-        self._badge(tl,"Movement Camera","tr")   # moved to top-right now
-        self._badge(tr,"Emotion Camera","tr")
-        self._badge(bl,"Cumulative R_0","bl")
-        self._badge(br,"Affect Traces","br")
-        grid=np.zeros((self.cell_h*2,self.cell_w*2,3),np.uint8)
-        grid[0:self.cell_h,0:self.cell_w]=tl
-        grid[0:self.cell_h,self.cell_w:]=tr
-        grid[self.cell_h:,0:self.cell_w]=bl
-        grid[self.cell_h:,self.cell_w:]=br
+            if img is None: return np.zeros((self.cell_h, self.cell_w, 3), np.uint8)
+            return cv2.resize(img, (self.cell_w, self.cell_h))
+        tl, tr, bl, br = map(fit, (hand, emo, mov_plot, va_plot))
+        self._badge(tl, "Movement Camera", "tr")
+        self._badge(tr, "Emotion Camera", "tr")
+        self._badge(bl, "Cumulative R_0", "bl")
+        self._badge(br, "Affect Traces", "br")
+        grid = np.zeros((self.cell_h * 2, self.cell_w * 2, 3), np.uint8)
+        grid[0:self.cell_h, 0:self.cell_w] = tl
+        grid[0:self.cell_h, self.cell_w:] = tr
+        grid[self.cell_h:, 0:self.cell_w] = bl
+        grid[self.cell_h:, self.cell_w:] = br
+
+        # Short-lived event badge (most recent)
+        now = time.monotonic()
+        with self.lock:
+            self._active_events = [e for e in self._active_events if e["expires"] > now]
+            events = list(self._active_events)
+        if events:
+            e = events[-1]
+            text = e["text"]
+            x_off, y_off = 0, self.cell_h
+            overlay = grid.copy()
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            bw, bh = tw + 36, th + 22
+            x0, y0 = x_off + 10, y_off + 10
+            cv2.rectangle(overlay, (x0, y0), (x0 + bw, y0 + bh), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.45, grid, 1 - 0.45, 0, grid)
+            cv2.rectangle(grid, (x0, y0), (x0 + bw, y0 + bh), (200, 200, 200), 1)
+            sym_c = (0, 0, 255) if "high" in text.lower() else (255, 255, 0)
+            cv2.circle(grid, (x0 + 14, y0 + bh // 2), 7, sym_c, -1)
+            cv2.putText(grid, text, (x0 + 28, y0 + bh - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 1, cv2.LINE_AA)
+
         return grid
 
     # ---------- loop ----------
     def _loop(self):
         from control_flags import stop_event
+        stall_t0 = time.monotonic()
         while self._run_flag.is_set():
-            if self._is_open.is_set():
-                with self.lock:
-                    hand=self.hand_frame.copy() if self.hand_frame is not None else None
-                    emo=self.emo_frame.copy() if self.emo_frame is not None else None
-                    r0=list(self.r0_cum_hist); avg=self.r0_last_avg_speed
-                    va=list(self.va_hist)
-                mov=self._render_plot_line(r0,"R_0 cumulative (mm)",avg,center_tip=True)
-                va_plot=self._render_va(va)
-                grid=self._compose_grid(hand,emo,mov,va_plot)
-                cv2.imshow(self.title,grid)
-                key=cv2.waitKey(1)&0xFF
-                if key==ord('q'): self.close_window()
-                elif key==27:
-                    print("[⛔] ESC (window) → stopping."); stop_event.set()
-            time.sleep(self.target_dt)
+            try:
+                if self._is_open.is_set():
+                    with self.lock:
+                        hand = self.hand_frame.copy() if self.hand_frame is not None else None
+                        emo = self.emo_frame.copy() if self.emo_frame is not None else None
+                        r0 = list(self.r0_cum_hist); avg = self.r0_last_avg_speed
+                        va = list(self.va_hist)
+                    mov = self._render_plot_line(r0, "R_0 cumulative (mm)", avg)
+                    va_plot = self._render_va(va)
+                    grid = self._compose_grid(hand, emo, mov, va_plot)
+                    cv2.imshow(self.title, grid)
+                    key = cv2.waitKey(1) & 0xFF
+                    if key == ord('q'):
+                        self.close_window()
+                    elif key == 27:
+                        print("[⛔] ESC (window) → stopping."); stop_event.set()
+                    stall_t0 = time.monotonic()
+                else:
+                    cv2.waitKey(1)
+                    if (time.monotonic() - stall_t0) > 2.0:
+                        self.logger.warn("Preview hidden for >2s; UI idle")
+                        self.logger.periodic_flush()
+                        stall_t0 = time.monotonic()
+                time.sleep(self.target_dt)
+            except Exception as e:
+                self.logger.warn(f"Preview loop transient error: {e}")
+                self.logger.periodic_flush()
+                time.sleep(self.target_dt)

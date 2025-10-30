@@ -29,8 +29,11 @@ from emotion_processor import emotion_worker
 from camera_utils import load_serial_map
 from audio_worker import audio_worker
 
-# NEW: shared control flags (pause/stop) used by all modules
+# shared control flags
 from control_flags import pause_event, stop_event
+
+# centralized logging
+from logger_utils import get_preview_logger, log_exception
 
 def _sig_stop(signum, frame):
     print("\n[⛔] SIGINT → stopping…", flush=True)
@@ -39,8 +42,7 @@ signal.signal(signal.SIGINT, _sig_stop)
 
 # --- Terminal keyboard listener (SPACE / 'g' / ESC) ---
 def start_keyboard_listener(preview_ref):
-    """Listen on the terminal for SPACE (pause), 'g' (reopen grid), ESC (stop).
-       Skips if stdin is not a TTY (e.g., launched from an IDE)."""
+    """Listen on the terminal for SPACE (pause), 'g' (reopen grid), ESC (stop)."""
     if not sys.stdin.isatty():
         print("[INFO] Keyboard listener disabled (stdin is not a TTY).", flush=True)
         return None
@@ -79,7 +81,7 @@ def start_keyboard_listener(preview_ref):
                     print("[⛔] ESC pressed (terminal) → stopping.", flush=True)
                     stop_event.set()
                     try:
-                        os.kill(os.getpid(), signal.SIGINT)  # nudge blocking waits
+                        os.kill(os.getpid(), signal.SIGINT)
                     except Exception:
                         pass
                     break
@@ -99,7 +101,7 @@ def build_argparser():
     ap.add_argument("--duration-sec", type=float, required=True, help="ACTIVE duration in seconds")
     ap.add_argument("--save-every", type=int, default=1, help="Save raw color/depth every Nth frame (0=off)")
     ap.add_argument("--filters", choices=["on","off"], default="off", help="Depth filters on/off")
-    ap.add_argument("--viz-live", choices=["off","window"], default="off", help="Preview window (unified 2x2 grid)")
+    ap.add_argument("--viz-live", choices=["off","on"], default="on", help="Preview window (unified 2x2 grid)")
     ap.add_argument("--force-flip", choices=["flip","same"], default="flip", help="Global handedness flip baseline")
     ap.add_argument("--stride", type=int, default=1, help="Process every Nth frame for movement")
     ap.add_argument("--backpressure", choices=["drop-latest","block"], default="drop-latest", help="Processor queue policy")
@@ -109,18 +111,22 @@ def build_argparser():
     ap.add_argument("--emo-stride", type=int, default=1, help="Process every Nth frame for emotion")
     ap.add_argument("--emo-csv-flush", type=int, default=30, help="CSV flush interval (frames) for emotion")
 
-    # —— Movement vs Emotion camera selection ——
+    # camera selection
     ap.add_argument("--process-mov-cams", nargs="*", help="Labels to process for hand movement.")
     ap.add_argument("--process-emo-cams", nargs="*", help="Labels to process for emotion (valence/arousal).")
 
-    # —— Audio ——
+    # audio
     ap.add_argument("--audio-out", default=None, help="Audio output directory (default: <output-dir>/audio)")
     ap.add_argument("--audio-duration-sec", type=float, default=0, help="Active duration for audio (0=off)")
     ap.add_argument("--rate", type=int, choices=[44100,48000], default=44100, help="Audio sample rate")
 
-    # Annotated movement preview saver (already re-added earlier)
+    # annotated movement preview saver
     ap.add_argument("--viz-save-every", type=int, default=3,
                     help="Save annotated movement preview every N frames (0 = OFF)")
+
+    # event checker toggle
+    ap.add_argument("--no-event-checker", action="store_true",
+                    help="Disable the R0 expected-speed event checker (default: enabled)")
     return ap
 
 def main():
@@ -128,6 +134,9 @@ def main():
 
     out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Central loggers for this run
+    preview_logger = get_preview_logger(out_dir, flush_sec=max(1, args.log_flush_sec))
 
     # Discover cams
     serial_to_label = load_serial_map()
@@ -139,31 +148,45 @@ def main():
         return
     print(f"[INFO] Connected cams: {', '.join([f'{lab}({s})' for s,lab in active])}")
 
-    # Movement selection:
+    # Movement selection
     if args.process_mov_cams is not None:
         process_set_mov: Set[str] = set([lab.strip() for lab in args.process_mov_cams if lab and lab.strip()])
     else:
-        process_set_mov = set(lab for _, lab in active)  # default: all for movement
+        process_set_mov = set(lab for _, lab in active)  # default: all cams
 
-    # Emotion selection:
+    # Emotion selection
     if args.process_emo_cams is None:
         process_set_emo: Set[str] = set()  # default: none
     else:
         process_set_emo = set([lab.strip() for lab in args.process_emo_cams if lab and lab.strip()])
 
+    # Friendly status
     print(f"[INFO] Movement cams: {sorted(process_set_mov) if process_set_mov else 'NONE'}")
     print(f"[INFO] Emotion cams:  {sorted(process_set_emo) if process_set_emo else 'NONE'}")
+    if not args.no_event_checker and process_set_mov:
+        try:
+            refcsv = SPEED_TRIGGER_REFCSV_PATH
+        except NameError:
+            refcsv = "(default in trigger)"
+        print(f"[INFO] Speed-trigger checker: ENABLED (reference CSV: {refcsv})")
+    else:
+        print("[INFO] Speed-trigger checker: DISABLED")
 
-    # Start unified preview if requested
+    # Unified preview
     PREVIEW = None
-    if args.viz_live == "window":
-        PREVIEW = PreviewGrid(title="Unified Preview", history_len=max(240, args.emo_history), target_fps=30)
+    if args.viz_live == "on":
+        PREVIEW = PreviewGrid(
+            title="Unified Preview",
+            history_len=max(240, args.emo_history),
+            target_fps=30,
+            logger=preview_logger,
+        )
         PREVIEW.start()
 
-    # Start terminal keyboard listener (SPACE / g / ESC)
+    # Keyboard listener (SPACE / g / ESC)
     _kbd = start_keyboard_listener(PREVIEW)
 
-    # Spawn per-cam queues & threads
+    # Queues & threads
     cap_threads = []
     proc_threads = []
     queues_mov: Dict[str, queue.Queue] = {}
@@ -178,8 +201,12 @@ def main():
             queues_mov[label] = q_mov
             t_proc_mov = threading.Thread(
                 target=processor_worker,
-                args=(label, q_mov, out_dir, args.force_flip, max(1,args.stride),
-                      max(1,args.csv_flush), max(1,args.log_flush_sec), PREVIEW, max(0, args.viz_save_every)),
+                args=(
+                    label, q_mov, out_dir, args.force_flip, max(1, args.stride),
+                    max(1, args.csv_flush), max(1, args.log_flush_sec),
+                    PREVIEW, max(0, args.viz_save_every),
+                ),
+                kwargs=dict(event_checker_enabled=(not args.no_event_checker)),
                 daemon=True, name=f"proc-mov-{label}"
             )
             t_proc_mov.start()
@@ -190,8 +217,9 @@ def main():
             queues_emo[label] = q_emo
             t_proc_emo = threading.Thread(
                 target=emotion_worker,
-                args=(label, q_emo, out_dir, max(1,args.emo_stride),
-                      max(1,args.emo_csv_flush), max(1,args.log_flush_sec), max(10,args.emo_history), PREVIEW),
+                args=(label, q_emo, out_dir, max(1, args.emo_stride),
+                      max(1, args.emo_csv_flush), max(1, args.log_flush_sec),
+                      max(10, args.emo_history), PREVIEW),
                 daemon=True, name=f"proc-emo-{label}"
             )
             t_proc_emo.start()
@@ -199,14 +227,15 @@ def main():
 
         t_cap = threading.Thread(
             target=capture_worker,
-            args=(serial, label, out_dir, float(args.duration_sec), max(0,args.save_every),
-                  (args.filters=="on"), queues_mov.get(label, None), queues_emo.get(label, None), args.backpressure),
+            args=(serial, label, out_dir, float(args.duration_sec), max(0, args.save_every),
+                  (args.filters == "on"), queues_mov.get(label, None),
+                  queues_emo.get(label, None), args.backpressure),
             daemon=True, name=f"cap-{label}"
         )
         t_cap.start()
         cap_threads.append(t_cap)
-    
-    # --------- Audio: only start for whitelisted devices that are PRESENT ----------
+
+    # --------- Audio (only whitelisted devices that are PRESENT) ----------
     def _list_alsa_hw_devices():
         try:
             out = subprocess.check_output(["arecord", "-l"], stderr=subprocess.STDOUT, text=True)
@@ -229,7 +258,6 @@ def main():
     aud_dir = Path(args.audio_out) if args.audio_out else (out_dir / "audio")
     if args.audio_duration_sec > 0:
         present = set(_list_alsa_hw_devices())
-        # Only use the intersection of PRESENT devices and your WHITELIST
         enabled = [d for d in VALID_MIC_IDS if d in present]
         if not enabled:
             print("[INFO] 🎙 No whitelisted mics detected; skipping audio.")
@@ -237,24 +265,33 @@ def main():
             for dev in enabled:
                 t = threading.Thread(
                     target=audio_worker,
-                    args=(dev, aud_dir, float(args.audio_duration_sec), int(args.rate)),
+                    args=(dev, aud_dir, float(args.audio_duration_sec), int(args.rate), preview_logger),
                     daemon=True, name=f"aud-{dev}"
                 )
-                t.start()
                 audio_threads.append(t)
+            for t in audio_threads:
+                t.start()
             print(f"[INFO] 🎙 Audio enabled on {len(audio_threads)} mic(s): {', '.join(enabled)} → {aud_dir}")
 
-    # Wait for capture to finish, then signal processors to exit by closing queues, then join audio
+    # Wait for capture to finish, then cleanly stop processors & audio
     try:
         for t in cap_threads:
             t.join()
+    except Exception as e:
+        log_exception(preview_logger, "Error while joining capture threads", e)
     finally:
         for q in list(queues_mov.values()) + list(queues_emo.values()):
             setattr(q, "closed", True)
         for t in proc_threads:
-            t.join()
+            try:
+                t.join()
+            except Exception as e:
+                log_exception(preview_logger, "Error while joining processor threads", e)
         for t in audio_threads:
-            t.join()
+            try:
+                t.join()
+            except Exception as e:
+                log_exception(preview_logger, "Error while joining audio threads", e)
         if PREVIEW is not None:
             PREVIEW.stop()
         try:
@@ -263,6 +300,7 @@ def main():
         except Exception:
             pass
 
+    preview_logger.periodic_flush(force=True)
     print("[🏁] Done.")
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# capture_worker.py
+# capture_worker.py — robust RealSense capture with warm-up, retries, and auto-reset
+
 import time
 import threading
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 import queue as pyqueue
 
 import numpy as np
@@ -14,11 +15,38 @@ from tunables import FALLBACK_DEPTH_SCALE
 from control_flags import pause_event, stop_event
 from logger_utils import DebouncedLogger
 from types_shared import FramePacket
-from camera_utils import write_camera_info  # assumed present in your modularization
+from camera_utils import write_camera_info  # assumed present
+
+# Tunables for robustness
+STARTUP_DISCARD = 30              # discard first N frames for auto-exposure/convergence
+WAIT_TIMEOUT_WARM_MS = 2000       # 2.0 s during warm-up
+WAIT_TIMEOUT_STEADY_MS = 1200     # 1.2 s during steady-state
+MAX_TIMEOUTS_BEFORE_RESET = 60    # consecutive timeouts before we reset pipeline
+WARN_EVERY_TIMEOUTS = 5
 
 # Keep a shared notion of cam2's depth scale for cross-cam consistency
 _CAM2_DEPTH_SCALE_LOCK = threading.Lock()
 _CAM2_DEPTH_SCALE: Optional[float] = None  # learned during run from cam2
+
+
+def _safe_put(q: Optional["pyqueue.Queue"], pkt: FramePacket, backpressure: str):
+    if q is None:
+        return
+    try:
+        if backpressure == "block":
+            q.put(pkt, timeout=0.01)
+        else:
+            q.put_nowait(pkt)
+    except pyqueue.Full:
+        # drop-then-insert (keeps freshest)
+        try:
+            _ = q.get_nowait()
+        except Exception:
+            pass
+        try:
+            q.put_nowait(pkt)
+        except Exception:
+            pass
 
 
 def capture_worker(
@@ -37,6 +65,7 @@ def capture_worker(
     publishes FramePacket(s) to movement / emotion queues, and optionally saves raw frames.
     Honors global pause/stop (SPACE / ESC) via control_flags.
     """
+
     cam_dir = out_dir / cam_label
     color_dir = cam_dir / "color"
     depth_dir = cam_dir / "depth"
@@ -46,16 +75,24 @@ def capture_worker(
 
     logger = DebouncedLogger(cam_dir / "logs" / "capture_rt.log", flush_interval_sec=5)
 
+    # Build pipeline & config
     pipeline = rs.pipeline()
     cfg = rs.config()
     cfg.enable_device(serial)
     cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
     cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
 
-    try:
-        profile = pipeline.start(cfg)
-    except Exception as e:
-        print(f"[ERROR] Failed to start RealSense {cam_label} ({serial}): {e}")
+    def _start_pipeline() -> Optional[rs.pipeline_profile]:
+        try:
+            return pipeline.start(cfg)
+        except Exception as e:
+            logger.warn(f"Failed to start RealSense {cam_label} ({serial}): {e}")
+            logger.periodic_flush()
+            return None
+
+    profile = _start_pipeline()
+    if profile is None:
+        print(f"[ERROR] Failed to start RealSense {cam_label} ({serial}).")
         return
 
     align = rs.align(rs.stream.color)
@@ -85,10 +122,7 @@ def capture_worker(
     # Use color intrinsics
     color_key = next((k for k in intr_json.keys() if k.startswith("color_")), None)
     if color_key is None:
-        fx = 604.7
-        fy = 604.9
-        cx = 313.8
-        cy = 252.7  # conservative fallback
+        fx, fy, cx, cy = 604.7, 604.9, 313.8, 252.7  # conservative fallback
     else:
         fx = float(intr_json[color_key]["fx"])
         fy = float(intr_json[color_key]["fy"])
@@ -104,44 +138,76 @@ def capture_worker(
     active_elapsed = 0.0
     last_tick = time.monotonic()
 
-    def _publish(qtarget: Optional["pyqueue.Queue[FramePacket]"], pkt: FramePacket):
-        if qtarget is None:
-            return
-        try:
-            if backpressure == "block":
-                qtarget.put(pkt, timeout=0.01)
-            else:
-                qtarget.put_nowait(pkt)
-        except pyqueue.Full:
-            # drop-then-insert (keeps freshest)
-            try:
-                _ = qtarget.get_nowait()
-            except Exception:
-                pass
-            try:
-                qtarget.put_nowait(pkt)
-            except Exception:
-                pass
+    timeouts_in_row = 0
+    discarded = 0
+    warmup = True
 
     try:
         while not stop_event.is_set() and active_elapsed < duration_sec:
             # Pause support (SPACE)
             if pause_event.is_set():
-                # Do not accumulate active time while paused
                 last_tick = time.monotonic()
                 time.sleep(0.02)
                 continue
 
+            # Try fast non-blocking fetch first
+            fs = None
             try:
-                frames = pipeline.wait_for_frames()
-            except Exception:
-                # transient device hiccup
+                fs = pipeline.poll_for_frames()
+                if not fs:
+                    # fall back to blocking with timeout (warm vs steady)
+                    timeout_ms = WAIT_TIMEOUT_WARM_MS if warmup else WAIT_TIMEOUT_STEADY_MS
+                    try:
+                        fs = pipeline.wait_for_frames(timeout_ms)
+                    except Exception as _:
+                        fs = None
+                # Handle no-frames case as timeout
+                if not fs:
+                    timeouts_in_row += 1
+                    if timeouts_in_row % WARN_EVERY_TIMEOUTS == 0:
+                        logger.warn(
+                            f"{cam_label}: no frames for {timeouts_in_row} consecutive attempts "
+                            f"(warmup={warmup}, timeout_ms={WAIT_TIMEOUT_WARM_MS if warmup else WAIT_TIMEOUT_STEADY_MS})"
+                        )
+                    # Don’t charge active time when we starve
+                    last_tick = time.monotonic()
+                    # Auto-reset if starved for long
+                    if timeouts_in_row >= MAX_TIMEOUTS_BEFORE_RESET:
+                        logger.warn(f"{cam_label}: resetting pipeline after {timeouts_in_row} timeouts.")
+                        try:
+                            pipeline.stop()
+                        except Exception:
+                            pass
+                        time.sleep(0.2)
+                        profile = _start_pipeline()
+                        if profile is None:
+                            logger.warn(f"{cam_label}: restart failed; will keep retrying.")
+                            time.sleep(0.3)
+                        else:
+                            logger.info(f"{cam_label}: pipeline restarted.")
+                            timeouts_in_row = 0
+                            discarded = 0
+                            warmup = True
+                    time.sleep(0.005)
+                    continue  # retry loop
+                else:
+                    timeouts_in_row = 0
+            except Exception as e:
+                # Unexpected device error: log and try to continue
+                logger.warn(f"{cam_label}: exception fetching frames: {e}")
+                last_tick = time.monotonic()
+                time.sleep(0.01)
                 continue
 
-            aligned = align.process(frames)
-            c = aligned.get_color_frame()
-            d = aligned.get_depth_frame()
-            if not c or not d:
+            # Align & fetch frames
+            try:
+                aligned = align.process(fs)
+                c = aligned.get_color_frame()
+                d = aligned.get_depth_frame()
+                if not c or not d:
+                    # treat as soft miss
+                    continue
+            except Exception:
                 continue
 
             if filters_on:
@@ -152,17 +218,31 @@ def capture_worker(
                 except Exception:
                     pass
 
+            # Warm-up discard
+            if warmup:
+                discarded += 1
+                if discarded < STARTUP_DISCARD:
+                    # keep UI responsive, don’t count active time
+                    last_tick = time.monotonic()
+                    continue
+                else:
+                    warmup = False
+                    logger.info(f"{cam_label}: warm-up completed after {discarded} frames.")
+
             color_img = np.asanyarray(c.get_data())
             depth_img = np.asanyarray(d.get_data())
 
             # Save raw
             if save_every > 0 and (frame_id % save_every == 0):
-                cv2.imwrite(str(color_dir / f"frame_{frame_id:06d}.png"), color_img)
-                cv2.imwrite(
-                    str(depth_dir / f"frame_{frame_id:06d}.tiff"),
-                    depth_img,
-                    [cv2.IMWRITE_TIFF_COMPRESSION, 1],
-                )
+                try:
+                    cv2.imwrite(str(color_dir / f"frame_{frame_id:06d}.png"), color_img)
+                    cv2.imwrite(
+                        str(depth_dir / f"frame_{frame_id:06d}.tiff"),
+                        depth_img,
+                        [cv2.IMWRITE_TIFF_COMPRESSION, 1],
+                    )
+                except Exception as e:
+                    logger.warn(f"{cam_label}: failed to save frame {frame_id}: {e}")
 
             # Publish to processing pipelines (if enabled for this cam)
             pkt = FramePacket(
@@ -178,8 +258,8 @@ def capture_worker(
                 cy=cy,
                 depth_scale_m=depth_scale_m,
             )
-            _publish(q_mov, pkt)
-            _publish(q_emo, pkt)
+            _safe_put(q_mov, pkt, backpressure)
+            _safe_put(q_emo, pkt, backpressure)
 
             frame_id += 1
 
@@ -189,10 +269,14 @@ def capture_worker(
 
             if stop_event.is_set():
                 break
+
     finally:
         try:
             pipeline.stop()
         except Exception:
             pass
-        logger.info(f"Finished capture {cam_label}: frames={frame_id}, active_elapsed={active_elapsed:.2f}s")
+        logger.info(
+            f"Finished capture {cam_label}: frames={frame_id}, active_elapsed={active_elapsed:.2f}s, "
+            f"warmup_discarded={discarded}, last_timeouts={timeouts_in_row}"
+        )
         logger.periodic_flush(force=True)

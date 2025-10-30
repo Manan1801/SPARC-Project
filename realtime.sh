@@ -1,259 +1,201 @@
 #!/usr/bin/env bash
 # realtime.sh — Interactive wrapper for realtime_capture.py (movement + emotion)
+# Simplified: only main run arguments are interactive; rest under advanced controls.
 
 set -euo pipefail
 
+# ───────────────────────── Conda environment ─────────────────────────
+NEED_DEACTIVATE=0
+cleanup() {
+  if [[ "${NEED_DEACTIVATE:-0}" -eq 1 ]]; then
+    set +e
+    conda deactivate >/dev/null 2>&1
+    set -e
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if command -v conda >/dev/null 2>&1; then
+  CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+  if [[ -n "${CONDA_BASE:-}" && -f "$CONDA_BASE/etc/profile.d/conda.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+    if [[ "${CONDA_DEFAULT_ENV:-}" != "realtime_v2" ]]; then
+      conda activate realtime_v2
+      NEED_DEACTIVATE=1
+    fi
+  else
+    echo "[ERROR] Conda environment not initialized. Run: conda init bash"
+    exit 1
+  fi
+else
+  echo "[ERROR] 'conda' not found in PATH."
+  exit 1
+fi
+
+# ───────────────────────────── Script setup ───────────────────────────
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 SCRIPT_PATH="${SCRIPT_PATH:-./scripts/realtime_capture.py}"
 
-if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
-  echo "[ERROR] python not found (looked for '$PYTHON_BIN'). Set PYTHON_BIN env var if needed."
-  exit 1
-fi
 if [[ ! -f "$SCRIPT_PATH" ]]; then
-  echo "[ERROR] Script not found at: $SCRIPT_PATH"
-  echo "        Set SCRIPT_PATH env var or place this launcher next to realtime_capture.py"
+  echo "[ERROR] Script not found at $SCRIPT_PATH"
   exit 1
 fi
 
-ask() {
-  local prompt="${1}"; shift || true
-  local default="${1:-}"; shift || true
-  local reply
-  if [[ -n "$default" ]]; then
-    read -r -p "$prompt [$default]: " reply || true
-    echo "${reply:-$default}"
-  else
-    read -r -p "$prompt: " reply || true
-    echo "$reply"
-  fi
-}
+# ────────────────────────────── Helpers ───────────────────────────────
+ask() { local p="$1"; local d="${2:-}"; local r; read -r -p "$p [$d]: " r || true; echo "${r:-$d}"; }
+ask_yn() { local p="$1"; local d="${2:-y}"; local a; while true; do a="$(ask "$p (y/n)" "$d")"; case "${a,,}" in y|yes) echo "y"; return;; n|no) echo "n"; return;; esac; done; }
 
-ask_yn() {
-  local prompt="$1"; shift
-  local def="${1:-y}"
-  local ans
-  while true; do
-    ans="$(ask "$prompt (y/n)" "$def")"
-    case "${ans,,}" in
-      y|yes) echo "y"; return 0 ;;
-      n|no)  echo "n"; return 0 ;;
-      *) echo "Please answer y or n." ;;
-    esac
-  done
-}
-
-ask_choice() {
-  local prompt="$1"; shift
-  local choices="$1"; shift
-  local def="${1:-}"
-  local ans
-  IFS='|' read -r -a opts <<< "$choices"
-  while true; do
-    ans="$(ask "$prompt (${choices//|//})" "$def")"
-    for o in "${opts[@]}"; do
-      if [[ "${ans,,}" == "${o,,}" ]]; then
-        echo "$o"; return 0
-      fi
-    done
-    echo "Please choose one of: $choices"
-  done
-}
-
+# ─────────────────────────────── Banner ───────────────────────────────
 cat <<'BANNER'
 ────────────────────────────────────────────────────────────────
    Real-Time Unified Pipeline — Interactive Launcher
    (captures all cams; selectively process Movement and/or Emotion)
 ────────────────────────────────────────────────────────────────
 Controls during run:
-  • Pause/Resume : SPACE
-  • Close grid   : q     (pipeline continues)
-  • Reopen grid  : g     (press in terminal)
-  • Stop         : ESC or Ctrl+C
+  • SPACE  → Pause/Resume
+  • q      → Close grid (pipeline continues)
+  • g      → Reopen grid
+  • ESC/Ctrl+C → Stop gracefully
 ────────────────────────────────────────────────────────────────
 BANNER
 
+# ─────────────────────────── Basic Controls ───────────────────────────
 OUTPUT_DIR="$(ask "Output directory" "./run_$(date +%Y%m%d_%H%M%S)")"
-DUR_SEC="$(ask "Active recording duration in seconds" "60")"
+DUR_SEC="$(ask "Active recording duration (sec)" "60")"
+SAVE_EVERY="$(ask "Save raw frames? Enter N (0 = OFF)" "1")"
+VIZ_LIVE="$(ask "Live preview window? (off/on)" "on")"
 
 echo
 echo "Which camera(s) to PROCESS for MOVEMENT?"
-echo "  - Enter comma-separated labels (e.g., cam2 or cam1,cam3)"
+echo "  - Comma-separated labels (e.g., cam2 or cam1,cam3)"
 echo "  - Enter 'all' to process all"
-echo "  - Enter 'none' for capture-only (no RT movement)"
+echo "  - Enter 'none' for capture-only"
 PROC_MOV_INPUT="$(ask "Movement cams" "cam2")"
-
-declare -a PROC_MOV_ARR=()
-PROC_MOV_MODE="some"
-case "${PROC_MOV_INPUT,,}" in
-  ""|"all") PROC_MOV_MODE="all" ;;
-  "none")   PROC_MOV_MODE="none" ;;
-  *)
-    IFS=',' read -r -a rawcams <<< "$PROC_MOV_INPUT"
-    for c in "${rawcams[@]}"; do
-      c_trim="$(echo "$c" | xargs)"
-      [[ -n "$c_trim" ]] && PROC_MOV_ARR+=("$c_trim")
-    done
-    if [[ "${#PROC_MOV_ARR[@]}" -eq 0 ]]; then PROC_MOV_MODE="all"; fi
-    ;;
-esac
 
 echo
 echo "Which camera(s) to PROCESS for EMOTION (valence/arousal)?"
-echo "  - Enter comma-separated labels (e.g., cam3 or cam1,cam2)"
-echo "  - Enter 'none' to disable emotion processing"
-PROC_EMO_INPUT="$(ask "Emotion cams" "none")"
+echo "  - Comma-separated labels (e.g., cam3 or cam1,cam2)"
+echo "  - Enter 'none' to disable"
+PROC_EMO_INPUT="$(ask "Emotion cams" "cam1")"
 
-declare -a PROC_EMO_ARR=()
-PROC_EMO_MODE="some"
-case "${PROC_EMO_INPUT,,}" in
-  ""|"none") PROC_EMO_MODE="none" ;;
-  *)
-    IFS=',' read -r -a rawemo <<< "$PROC_EMO_INPUT"
-    for c in "${rawemo[@]}"; do
-      c_trim="$(echo "$c" | xargs)"
-      [[ -n "$c_trim" ]] && PROC_EMO_ARR+=("$c_trim")
-    done
-    if [[ "${#PROC_EMO_ARR[@]}" -eq 0 ]]; then PROC_EMO_MODE="none"; fi
-    ;;
-esac
-
-SAVE_EVERY="$(ask "Save raw frames? Enter N (save every Nth frame; 0 = OFF)" "1")"
-FILTERS="$(ask_choice "Depth filters" "on|off" "off")"
-VIZ_LIVE="$(ask_choice "Live preview window (unified 2x2 grid)" "off|window" "off")"
-FORCE_FLIP="$(ask_choice "Handedness flip baseline (movement)" "flip|same" "flip")"
-
-AUDIO_ENABLE="$(ask_yn "Record microphones too?" "n")"
-if [[ "$AUDIO_ENABLE" == "y" ]]; then
-  RATE="$(ask_choice "Audio sample rate" "44100|48000" "44100")"
+EVENT_CHECKER_ENABLE="$(ask_yn "Enable R0 expected-speed event checker?" "y")"
+# Heads-up for where logs will land (per-cam), and the ref CSV (from tunables.py inside Python)
+if [[ "${EVENT_CHECKER_ENABLE,,}" == "y" ]]; then
+  echo "[INFO] Speed-trigger: ENABLED → per-cam logs at <cam_dir>/logs/speed_trigger.txt"
 else
-  RATE="44100"
+  echo "[INFO] Speed-trigger: DISABLED"
 fi
 
-ADVANCED="$(ask_yn "Enter Advanced Controls?" "n")"
+ADVANCED="$(ask_yn "Show advanced controls?" "n")"
 
-# Movement advanced defaults
+# ───────────────────────────── Defaults ───────────────────────────────
+FILTERS="off"
+FORCE_FLIP="flip"
 STRIDE="1"
 BKP_POLICY="drop-latest"
 VIZ_SAVE_EVERY="3"
 CSV_FLUSH="30"
 LOG_FLUSH_SEC="5"
-
-# Emotion advanced defaults
 EMO_HISTORY="240"
 EMO_STRIDE="1"
 EMO_CSV_FLUSH="30"
-
+AUDIO_ENABLE="n"
 AUDIO_OUT="$OUTPUT_DIR/audio"
 AUDIO_DUR="$DUR_SEC"
+RATE="44100"
 
+# ─────────────────────────── Advanced Controls ────────────────────────
 if [[ "$ADVANCED" == "y" ]]; then
-  echo
-  echo "── Advanced Controls (Movement) ──────────────"
-  STRIDE="$(ask "Movement processing stride (every Nth frame)" "1")"
-  BKP_POLICY="$(ask_choice "Frame backpressure policy" "drop-latest|block" "drop-latest")"
-  VIZ_SAVE_EVERY="$(ask "Save annotated movement previews every N frames (0 = OFF)" "3")"
+  echo "── Advanced Controls ───────────────────────────"
+  FILTERS="$(ask "Depth filters (on/off)" "off")"
+  FORCE_FLIP="$(ask "Handedness flip baseline (flip/same)" "flip")"
+  STRIDE="$(ask "Movement processing stride" "1")"
+  BKP_POLICY="$(ask "Backpressure policy (drop-latest/block)" "drop-latest")"
+  VIZ_SAVE_EVERY="$(ask "Save annotated previews every N frames (0=off)" "3")"
   CSV_FLUSH="$(ask "Movement CSV flush interval (frames)" "30")"
-  LOG_FLUSH_SEC="$(ask "Logger flush interval (seconds)" "5")"
-  echo "── Advanced Controls (Emotion) ───────────────"
-  EMO_HISTORY="$(ask "Emotion plot history length (frames)" "240")"
-  EMO_STRIDE="$(ask "Emotion processing stride (every Nth frame)" "1")"
-  EMO_CSV_FLUSH="$(ask "Emotion CSV flush interval (frames)" "30")"
+  LOG_FLUSH_SEC="$(ask "Logger flush interval (sec)" "5")"
+  EMO_HISTORY="$(ask "Emotion plot history (frames)" "240")"
+  EMO_STRIDE="$(ask "Emotion stride" "1")"
+  EMO_CSV_FLUSH="$(ask "Emotion CSV flush interval" "30")"
+  AUDIO_ENABLE="$(ask_yn "Record microphones?" "n")"
   if [[ "$AUDIO_ENABLE" == "y" ]]; then
-    echo "── Advanced Controls (Audio) ─────────────────"
-    AUDIO_OUT="$(ask "Audio output directory" "$AUDIO_OUT")"
-    AUDIO_DUR="$(ask "Audio active duration in seconds" "$AUDIO_DUR")"
+    AUDIO_OUT="$(ask "Audio output dir" "$AUDIO_OUT")"
+    AUDIO_DUR="$(ask "Audio duration (sec)" "$AUDIO_DUR")"
+    RATE="$(ask "Audio sample rate (44100/48000)" "44100")"
   fi
-  echo "──────────────────────────────────────────────"
+  echo "────────────────────────────────────────────────"
 fi
 
+# ─────────────────────────── Parse Cam Lists ──────────────────────────
 declare -a CMD
-CMD+=("$PYTHON_BIN" "$SCRIPT_PATH")
-CMD+=("--output-dir" "$OUTPUT_DIR")
-CMD+=("--duration-sec" "$DUR_SEC")
-CMD+=("--save-every" "$SAVE_EVERY")
-CMD+=("--filters" "$FILTERS")
-CMD+=("--viz-live" "$VIZ_LIVE")
-CMD+=("--force-flip" "$FORCE_FLIP")
-CMD+=("--stride" "$STRIDE")
-CMD+=("--backpressure" "$BKP_POLICY")
-CMD+=("--viz-save-every" "$VIZ_SAVE_EVERY")
-CMD+=("--csv-flush" "$CSV_FLUSH")
-CMD+=("--log-flush-sec" "$LOG_FLUSH_SEC")
+CMD+=("$PYTHON_BIN" "$SCRIPT_PATH" "--output-dir" "$OUTPUT_DIR" "--duration-sec" "$DUR_SEC" "--save-every" "$SAVE_EVERY")
+CMD+=("--viz-live" "$VIZ_LIVE" "--filters" "$FILTERS" "--force-flip" "$FORCE_FLIP")
+CMD+=("--stride" "$STRIDE" "--backpressure" "$BKP_POLICY" "--viz-save-every" "$VIZ_SAVE_EVERY")
+CMD+=("--csv-flush" "$CSV_FLUSH" "--log-flush-sec" "$LOG_FLUSH_SEC")
+CMD+=("--emo-history" "$EMO_HISTORY" "--emo-stride" "$EMO_STRIDE" "--emo-csv-flush" "$EMO_CSV_FLUSH")
 
-# Movement cams:
-if [[ "$PROC_MOV_MODE" == "none" ]]; then
+# Movement cams
+IFS=',' read -r -a MOV_ARR <<<"${PROC_MOV_INPUT// /}"
+if [[ "${PROC_MOV_INPUT,,}" != "none" && "${PROC_MOV_INPUT,,}" != "all" ]]; then
+  CMD+=("--process-mov-cams" "${MOV_ARR[@]}")
+elif [[ "${PROC_MOV_INPUT,,}" == "none" ]]; then
+  # Explicitly pass the flag with no values → argparse sees [] (no movement processing)
   CMD+=("--process-mov-cams")
-elif [[ "$PROC_MOV_MODE" == "some" ]]; then
-  CMD+=("--process-mov-cams")
-  for lab in "${PROC_MOV_ARR[@]}"; do CMD+=("$lab"); done
 fi
-# If PROC_MOV_MODE == "all", omit the flag (Python defaults to ALL)
 
-# Emotion cams:
-if [[ "$PROC_EMO_MODE" == "some" ]]; then
-  CMD+=("--process-emo-cams")
-  for lab in "${PROC_EMO_ARR[@]}"; do CMD+=("$lab"); done
+# Emotion cams
+IFS=',' read -r -a EMO_ARR <<<"${PROC_EMO_INPUT// /}"
+if [[ "${PROC_EMO_INPUT,,}" != "none" && "${PROC_EMO_INPUT,,}" != "" ]]; then
+  CMD+=("--process-emo-cams" "${EMO_ARR[@]}")
 fi
-# If PROC_EMO_MODE == "none", omit the flag (Python defaults to NONE for emotion)
 
-# Emotion tunables
-CMD+=("--emo-history" "$EMO_HISTORY")
-CMD+=("--emo-stride" "$EMO_STRIDE")
-CMD+=("--emo-csv-flush" "$EMO_CSV_FLUSH")
-
-# Audio
+# Audio controls
 if [[ "$AUDIO_ENABLE" == "y" ]]; then
-  CMD+=("--audio-out" "$AUDIO_OUT")
-  CMD+=("--audio-duration-sec" "$AUDIO_DUR")
-  CMD+=("--rate" "$RATE")
+  CMD+=("--audio-out" "$AUDIO_OUT" "--audio-duration-sec" "$AUDIO_DUR" "--rate" "$RATE")
 else
   CMD+=("--audio-duration-sec" "0")
 fi
 
+# Event checker toggle
+if [[ "${EVENT_CHECKER_ENABLE,,}" != "y" ]]; then
+  CMD+=("--no-event-checker")
+fi
+
+# ─────────────────────────── Summary ───────────────────────────
 echo
 echo "──────────────── RUN SUMMARY ────────────────"
-echo "Output dir              : $OUTPUT_DIR"
-echo "Duration (sec)          : $DUR_SEC"
-echo "Movement cams           : ${PROC_MOV_MODE^^}"
-if [[ "$PROC_MOV_MODE" == "some" ]]; then
-  echo "  • Labels              : ${PROC_MOV_ARR[*]}"
+echo "Output dir        : $OUTPUT_DIR"
+echo "Duration (sec)    : $DUR_SEC"
+echo "Save-every (raw)  : $SAVE_EVERY"
+echo "Live preview      : $VIZ_LIVE"
+echo "Movement cams     : $PROC_MOV_INPUT"
+echo "Emotion cams      : $PROC_EMO_INPUT"
+echo "Event checker     : $([[ "${EVENT_CHECKER_ENABLE,,}" == "y" ]] && echo "ENABLED (per-cam speed_trigger.txt)" || echo "DISABLED")"
+if [[ "$ADVANCED" == "y" ]]; then
+  echo "Depth filters     : $FILTERS"
+  echo "Flip baseline     : $FORCE_FLIP"
+  echo "Stride            : $STRIDE"
+  echo "Backpressure      : $BKP_POLICY"
+  echo "CSV flush         : $CSV_FLUSH"
+  echo "Log flush (sec)   : $LOG_FLUSH_SEC"
+  echo "Emotion history   : $EMO_HISTORY"
+  echo "Emotion stride    : $EMO_STRIDE"
+  echo "Emotion CSV flush : $EMO_CSV_FLUSH"
+  echo "Audio enabled     : $AUDIO_ENABLE"
 fi
-echo "Emotion cams            : ${PROC_EMO_MODE^^}"
-if [[ "$PROC_EMO_MODE" == "some" ]]; then
-  echo "  • Labels              : ${PROC_EMO_ARR[*]}"
-fi
-echo "Save-every (raw)        : $SAVE_EVERY"
-echo "Depth filters           : $FILTERS"
-echo "Live preview            : $VIZ_LIVE"
-echo "Force flip (movement)   : $FORCE_FLIP"
-echo "Stride (movement)       : $STRIDE"
-echo "Backpressure            : $BKP_POLICY"
-echo "Viz save-every (move)   : $VIZ_SAVE_EVERY"
-echo "CSV flush (move)        : $CSV_FLUSH"
-echo "Log flush (sec)         : $LOG_FLUSH_SEC"
-echo "Emotion history (frames): $EMO_HISTORY"
-echo "Emotion stride          : $EMO_STRIDE"
-echo "Emotion CSV flush       : $EMO_CSV_FLUSH"
-echo "Audio enabled           : $([[ "$AUDIO_ENABLE" == "y" ]] && echo "yes" || echo "no")"
-if [[ "$AUDIO_ENABLE" == "y" ]]; then
-  echo "  • Rate (Hz)           : $RATE"
-  echo "  • Audio out           : $AUDIO_OUT"
-  echo "  • Audio dur (s)       : $AUDIO_DUR"
-fi
-echo "─────────────────────────────────────────────"
-echo "Command to run:"
-printf '  %q ' "${CMD[@]}"; echo
 echo "─────────────────────────────────────────────"
 
 read -r -p "Proceed? (y/n) [y]: " CONFIRM
 CONFIRM="${CONFIRM:-y}"
-if [[ "${CONFIRM,,}" != "y" ]]; then
-  echo "Aborted."
-  exit 0
-fi
+[[ "${CONFIRM,,}" != "y" ]] && { echo "Aborted."; exit 0; }
 
 mkdir -p "$OUTPUT_DIR"
-if [[ "$AUDIO_ENABLE" == "y" ]]; then mkdir -p "$AUDIO_OUT"; fi
+[[ "$AUDIO_ENABLE" == "y" ]] && mkdir -p "$AUDIO_OUT"
 
-exec "${CMD[@]}"
+# ─────────────────────────── Execute ───────────────────────────
+set +e
+"${CMD[@]}"
+EXIT_CODE=$?
+set -e
+exit "$EXIT_CODE"

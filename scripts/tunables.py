@@ -33,9 +33,21 @@ DEFAULT_CELL_W = 640
 DEFAULT_CELL_H = 360
 
 # ---------- Audio device whitelist ----------
-# Example device IDs (use `arecord -l` to list):
-# 'hw:<card_number>,<device_number>'
 VALID_MIC_IDS = [
     'hw:2,0',
     'hw:3,0',
-    ]
+]
+
+# ================== Event trigger tunables (NEW) =======================================
+# Throttle logs/overlays to once per this many seconds (per slot)
+SPEED_TRIGGER_CADENCE_WINDOW_S = 30.0  # adjust as you like
+
+# Default path to the expected reference CSV (can be overridden per trigger)
+# CSV headers: time_s, lower_bound, upper_bound
+# SPEED_TRIGGER_REFCSV_PATH = "~/Desktop/SPARC-Project/right_wrist_speed_bounds.csv"
+SPEED_TRIGGER_REFCSV_PATH = "/home/robotics/Desktop/SPARC-Project/right_wrist_speed_bounds.csv"
+
+# How long the "High/Low Speed" label stays visible on the PreviewGrid
+SPEED_TRIGGER_OVERLAY_TTL_S = 6.0  # 5–7 seconds as requested
+
+# ========================================================================================
