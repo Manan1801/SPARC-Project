@@ -172,49 +172,34 @@ class RightWristSpeedTrigger(BaseTrigger):
 
 class ObjectUntouchedTrigger(BaseTrigger):
     """
-    GOOD iff within the current cadence window (length W = OBJECT_TRIGGER_WINDOW_SEC),
-    the number of objects whose untouched coverage ≥ 90% of W is in {2, 3}.
-    Otherwise BAD.
+    At every frame (each update call), evaluate the last W = OBJECT_TRIGGER_WINDOW_SEC seconds
+    (based on provided fps). Count objects untouched ≥ 90% of that window:
 
-    Expects confirmed untouched intervals as:
-        untouched_out = { obj_name: [[start_f, end_f], ...], ... }
+        < 2  -> "Bad:Less"
+        > 4  -> "Bad:More"
+        else -> "Good"
 
-    update(...) returns:
-        {
-          "good": bool,
-          "qualified_count": int,
-          "per_object_sec": {obj: seconds_in_window},
-          "per_object_pct": {obj: percentage_of_window},
-          "per_object_state": {obj: 'untouched'|'other'},  # at window end
-          "slot": int,
-          "window_start_s": float,
-          "window_end_s": float,
-        }
+    Log format (only line, no extras):
+        "[start_frame: end_frame) = <Good|Bad:Less|Bad:More>"
+
+    Logging starts only after a full window of frames is available.
     """
+
     def __init__(self,
                  cam_dir: Path,
-                 cam_label: Optional[str] = None,                 # ← now optional for compatibility
+                 cam_label: Optional[str] = None,                 # ← optional for compatibility
                  cadence_window_s: float = OBJECT_TRIGGER_WINDOW_SEC,
                  logger: Optional[DebouncedLogger] = None):
         super().__init__("objects_untouched")
         self.cam_label = cam_label or "(unknown)"
         self.cam_dir = Path(cam_dir)
         self.W = float(max(0.5, cadence_window_s))
-        # Threshold is always 90% of the window (per spec)
         self.tol_thresh = 0.9 * self.W
         self.logger: DebouncedLogger = logger if logger is not None else get_object_trigger_logger(self.cam_dir)
-        self._last_slot_logged: Optional[int] = None
+        self._last_slot_logged: Optional[int] = None  # kept for compatibility with prior versions
 
     def reset(self):
         self._last_slot_logged = None
-
-    def _slot_index(self, elapsed_s: float) -> int:
-        return int(math.floor(elapsed_time_s / self.W))
-
-    def _slot_bounds(self, slot_idx: int) -> Tuple[float, float]:
-        start_s = slot_idx * self.W
-        end_s = (slot_idx + 1) * self.W
-        return start_s, end_s
 
     @staticmethod
     def _overlap_len(a0: int, a1: int, b0: int, b1: int) -> int:
@@ -236,67 +221,87 @@ class ObjectUntouchedTrigger(BaseTrigger):
                frame_idx: int,
                fps: float,
                untouched_out: Dict[str, List[List[int]]],
-               preview_grid=None) -> dict:
-        # NOTE: object trigger does NOT pop any preview overlay (per spec).
-        slot = self._slot_index(elapsed_time_s)
-        win_s, win_e = self._slot_bounds(slot)
-        win_f0 = int(math.floor(win_s * fps))
-        win_f1 = int(math.floor(win_e * fps)) - 1  # inclusive end frame
-        window_len_s = self.W
+               preview_grid=None,
+               cam_label: Optional[str] = None) -> dict:
+        # Adopt runtime camera label if provided (keeps logs accurate)
+        if cam_label:
+            self.cam_label = cam_label
 
+        # minimal robustness: guard fps
+        efps = float(fps)
+        if not (efps > 0.0 and math.isfinite(efps)):
+            efps = 30.0  # safe default
+
+        # --- sliding window in frames based on fps ---
+        frames_per_window = max(1, int(round(self.W * efps)))
+        end_excl = int(frame_idx) + 1           # half-open window end
+        start_f  = end_excl - frames_per_window # inclusive start for full window
+        if start_f < 0:
+            # not enough history yet → do not log
+            # build a minimal return payload and exit
+            return {
+                "good": False,
+                "qualified_count": 0,
+                "per_object_sec": {},
+                "per_object_pct": {},
+                "per_object_state": {},
+                "slot": int(math.floor(elapsed_time_s / self.W)),
+                "window_start_s": 0.0,
+                "window_end_s": end_excl / efps,
+            }
+
+        start_incl = start_f
+        end_incl   = end_excl - 1
+        win_len_f  = frames_per_window
+        thresh_f   = int(math.ceil(0.9 * win_len_f))  # ≥ 90%
+
+        # Evaluate untouched coverage in this frame window
         per_obj_sec: Dict[str, float] = {}
         per_obj_pct: Dict[str, float] = {}
         per_obj_state: Dict[str, str] = {}
-
-        qualified = 0
+        count_qualified = 0
 
         for obj, spans in untouched_out.items():
-            # 1) Coverage (frames→seconds) inside this window
-            total_frames = 0
+            total_f = 0
             for s, e in spans:
-                total_frames += self._overlap_len(s, e, win_f0, win_f1)
-            sec = total_frames / float(max(1.0, fps))
+                total_f += self._overlap_len(s, e, start_incl, end_incl)
+            if total_f >= thresh_f:
+                count_qualified += 1
+
+            # metrics for return payload (seconds & percentage of W)
+            sec = total_f / efps
             per_obj_sec[obj] = sec
-            pct = (sec / window_len_s) * 100.0 if window_len_s > 0 else 0.0
-            per_obj_pct[obj] = pct
+            per_obj_pct[obj] = (sec / self.W) * 100.0 if self.W > 0 else 0.0
+            per_obj_state[obj] = "untouched" if self._contains_frame(spans, end_incl) else "other"
 
-            # 2) State at the window end
-            end_state = "untouched" if self._contains_frame(spans, win_f1) else "other"
-            per_obj_state[obj] = end_state
+        # Decide label
+        if count_qualified < 2:
+            label = "Bad:Less"
+            good_flag = False
+        elif count_qualified >= 4:
+            label = "Bad:More"
+            good_flag = False
+        else:
+            label = "Good"
+            good_flag = True
 
-            # 3) Qualification (≥ 90% of window)
-            if sec >= self.tol_thresh:
-                qualified += 1
+        # --- Log exactly one simple line per frame (no extras) ---
+        line = f"[{start_incl}: {end_excl}] = {label}"
+        try:
+            self.logger.info(line); self.logger.periodic_flush()
+        except Exception:
+            pass
 
-        good = (2 <= qualified <= 3)
-
-        # Log once per slot with full per-object breakdown
-        if self._last_slot_logged != slot:
-            status = "GOOD" if good else "BAD"
-            obj_chunks = []
-            for obj in sorted(per_obj_sec.keys()):
-                obj_chunks.append(
-                    f"{obj}: sec={per_obj_sec[obj]:.2f} pct={per_obj_pct[obj]:.1f}% state={per_obj_state[obj]}"
-                )
-            obj_str = " | ".join(obj_chunks)
-            line = (f"{_iso_now()} t={elapsed_time_s:.3f} slot={slot} "
-                    f"win=[{win_s:.1f},{win_e:.1f}) signal={status} qualified={qualified} "
-                    f"tol90={self.tol_thresh:.2f}s cam={self.cam_label} || {obj_str}")
-            try:
-                self.logger.info(line); self.logger.periodic_flush()
-            except Exception:
-                pass
-            self._last_slot_logged = slot
-
+        # Return payload (kept for compatibility)
         return {
-            "good": good,
-            "qualified_count": qualified,
+            "good": good_flag,
+            "qualified_count": count_qualified,
             "per_object_sec": per_obj_sec,
             "per_object_pct": per_obj_pct,
             "per_object_state": per_obj_state,
-            "slot": slot,
-            "window_start_s": win_s,
-            "window_end_s": win_e,
+            "slot": int(math.floor(elapsed_time_s / self.W)),
+            "window_start_s": start_incl / efps,
+            "window_end_s": end_excl / efps,
         }
 
 

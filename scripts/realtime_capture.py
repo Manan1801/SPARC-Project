@@ -190,7 +190,8 @@ def main():
                 for lab in sorted(process_set_obj):
                     cam_dir = out_dir / lab
                     obj_log = get_object_trigger_logger(cam_dir, flush_sec=max(1, args.log_flush_sec))
-                    trig = ObjectUntouchedTrigger(out_dir, logger=obj_log)  # (constructor kept as-is)
+                    cam_dir = out_dir / lab
+                    trig = ObjectUntouchedTrigger(cam_dir, cam_label=lab, logger=obj_log)
                     setattr(trig, "target_cam_labels", [lab])
                     obj_trigs[lab] = trig
                 print(f"[INFO] Object-trigger checker: ENABLED for {len(obj_trigs)} cam(s): {', '.join(obj_trigs.keys())}")

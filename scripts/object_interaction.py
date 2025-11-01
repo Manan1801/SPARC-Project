@@ -321,6 +321,9 @@ class ObjectInteraction:
         self.checking_out  = {obj: [] for obj in self.obj_order}
         self.warmup_good_count = {obj: 0 for obj in self.obj_order}
 
+        # NEW: keep a provisional open span per object for triggers (not persisted)
+        self._live_open: Dict[str, Optional[Tuple[int,int]]] = {obj: None for obj in self.obj_order}
+
         self.prev_two_yellow = None
         self.prev_gray_accept_xy = None
         self.prev_gray_accept_frame = None
@@ -348,6 +351,25 @@ class ObjectInteraction:
             box = detect_crop_box(color_full, self._aruco)
             if box is not None:
                 self.crop_box = box
+
+    # NEW: merge confirmed spans + live open interval (if any) for triggers
+    def get_untouched_spans_for_trigger(self, current_frame: int) -> Dict[str, List[List[int]]]:
+        merged: Dict[str, List[List[int]]] = {}
+        for obj in self.obj_order:
+            spans = [s[:] for s in self.untouched_out.get(obj, [])]
+            live = self._live_open.get(obj)
+            if live is not None:
+                a, b = live
+                # extend b to at least current_frame to be generous for coverage
+                b = max(b, int(current_frame))
+                if spans and a <= spans[-1][1] + 1:
+                    # overlaps/adjacent → extend last
+                    spans[-1][1] = max(spans[-1][1], b)
+                    spans[-1][0] = min(spans[-1][0], a)
+                else:
+                    spans.append([a, b])
+            merged[obj] = spans
+        return merged
 
     def ingest_frame(
         self,
@@ -481,7 +503,18 @@ class ObjectInteraction:
             checking_out=self.checking_out
         )
 
-        # 9) overlay — EXACTLY like the reference renderer (semi-transparent fill + contour outline, layered per object)
+        # NEW: update provisional open span (not persisted)
+        for obj in self.obj_order:
+            st = self.states[obj]
+            if st.interval_active and st.check_start is None:
+                if st.x_start is not None:
+                    live_start = max(0, int(st.x_start) - int(self.p))
+                    live_end   = int(st.last_good) if st.last_good is not None else int(fnum)
+                    self._live_open[obj] = (live_start, live_end)
+            else:
+                self._live_open[obj] = None
+
+        # 9) overlay saving (unchanged)
         if save_overlay and self.save and self.save.overlay_dir is not None:
             overlay = (mediapipe_overlay.copy()
                        if mediapipe_overlay is not None else color_full.copy())
@@ -514,31 +547,48 @@ class ObjectInteraction:
 
                     color_bgr = COLOR_MAP.get(obj, (255,255,255))
 
-                    # create colored fill for ROI
                     colored_roi = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
                     colored_roi[m > 0] = color_bgr
 
-                    # fetch fresh ROI each loop and blend
                     roi = overlay[y_min:y_max, x_min:x_max]
                     blended = cv2.addWeighted(roi, 1.0, colored_roi, 0.4, 0)
 
-                    # draw largest contour outline
                     cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                     if cnts:
                         cmax = max(cnts, key=cv2.contourArea)
                         cv2.drawContours(blended, [cmax], -1, color_bgr, thickness=2)
 
-                    # write back immediately (layering matches reference)
                     overlay[y_min:y_max, x_min:x_max] = blended
 
             out_path = self.save.overlay_dir / f"frame_{fnum:04d}.png"
             out_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(out_path), overlay)
 
-        # 10) return instantaneous state + masks + crop_box
-        def in_spans(spans, idx): return any(a <= idx <= b for (a,b) in spans)
-        state_now_untouched = {obj: in_spans(self.untouched_out.get(obj, []), fnum) for obj in self.obj_order}
-        state_now_checking  = {obj: in_spans(self.checking_out.get(obj,  []), fnum) for obj in self.obj_order}
+        # 10) return instantaneous state + masks + crop_box (LIVE-AWARE)
+        def in_spans(spans, idx): 
+            return any(a <= idx <= b for (a, b) in spans)
+
+        state_now_untouched = {}
+        state_now_checking  = {}
+
+        for obj in self.obj_order:
+            u = in_spans(self.untouched_out.get(obj, []), fnum)
+            c = in_spans(self.checking_out.get(obj,  []), fnum)
+
+            st = self.states.get(obj)
+            if st and st.interval_active:
+                if st.check_start is not None and st.check_end is not None:
+                    if st.check_start <= fnum <= st.check_end:
+                        c = True; u = False
+                else:
+                    if st.x_start is not None:
+                        live_u_start = max(0, int(st.x_start) - int(self.p))
+                        if live_u_start <= fnum:
+                            u = True; c = False
+
+            state_now_untouched[obj] = bool(u)
+            state_now_checking[obj]  = bool(c)
+
         return {
             "untouched": state_now_untouched,
             "checking": state_now_checking,

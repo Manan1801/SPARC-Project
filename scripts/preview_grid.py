@@ -149,6 +149,27 @@ class PreviewGrid:
                 self._obj_masks.clear()
             self._obj_crop_box = tuple(crop_box) if crop_box is not None else None
 
+    # --- NEW: compatibility wrapper for workers that send a single dict ---
+    def update_object_state(self, cam_label: str, obj_state: dict):
+        """
+        Accepts the unified dict returned by ObjectInteraction.ingest_frame():
+            {
+              'untouched': {...}, 'checking': {...},
+              'masks': {...}, 'crop_box': (x_min,y_min,x_max,y_max)
+            }
+        or (older): {'object_state': {...}} wrapping the same keys.
+        """
+        if not obj_state:
+            return
+        payload = obj_state.get("object_state", obj_state)
+        states = {
+            "untouched": payload.get("untouched", payload.get("untouched_out", {})),
+            "checking":  payload.get("checking",  payload.get("checking_out",  {})),
+        }
+        masks = payload.get("masks")
+        crop  = payload.get("crop_box")
+        self.update_objects(states, masks=masks, crop_box=crop)
+
     def _maybe_set_cell_size(self, img):
         h, w = img.shape[:2]
         maxw = 640

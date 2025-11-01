@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 import time
-import threading
 from pathlib import Path
 from collections import deque
 from typing import Dict, Optional
@@ -157,6 +156,38 @@ def object_worker(
             out[k] = canvas
         return out
 
+    # ✅ Normalize states to fixed legend keys expected by PreviewGrid
+    LEGEND_KEYS = ("red", "green", "gray", "yellow_1", "yellow_2", "gold")
+
+    def _expand_states_for_preview(raw_unt: Dict[str, bool],
+                                   raw_chk: Dict[str, bool],
+                                   masks: Dict[str, np.ndarray]) -> tuple[Dict[str, bool], Dict[str, bool]]:
+        """
+        Expand single 'yellow' into 'yellow_1'/'yellow_2' for both untouched/checking.
+        If masks contain yellow_1/yellow_2, use their presence as hint; otherwise copy the same flag to both.
+        Always return dicts with LEGEND_KEYS.
+        """
+        unt = {k: False for k in LEGEND_KEYS}
+        chk = {k: False for k in LEGEND_KEYS}
+
+        # Direct keys first
+        for k in ("red", "green", "gray", "gold"):
+            if k in raw_unt: unt[k] = bool(raw_unt.get(k, False))
+            if k in raw_chk: chk[k] = bool(raw_chk.get(k, False))
+
+        # Handle yellow family
+        if "yellow_1" in raw_unt or "yellow_2" in raw_unt or "yellow" in raw_unt:
+            yv = bool(raw_unt.get("yellow", False))
+            unt["yellow_1"] = bool(raw_unt.get("yellow_1", yv))
+            unt["yellow_2"] = bool(raw_unt.get("yellow_2", yv))
+        if "yellow_1" in raw_chk or "yellow_2" in raw_chk or "yellow" in raw_chk:
+            yv = bool(raw_chk.get("yellow", False))
+            chk["yellow_1"] = bool(raw_chk.get("yellow_1", yv))
+            chk["yellow_2"] = bool(raw_chk.get("yellow_2", yv))
+
+        # If masks only have a single 'yellow', mirroring already handled above.
+        return unt, chk
+
     # Helper: single-step process
     def _step(pkt: FramePacket):
         nonlocal t0, last_flush, depth_units_initialized
@@ -185,40 +216,51 @@ def object_worker(
             save_overlay=False
         )
 
-        # Window update
+        # Window update (use raw first; window isn't tied to preview legend)
         win.push(t_abs, states.get("untouched", {}), states.get("checking", {}))
 
         # Forward overlays to preview (if available)
+        local_masks = states.get("masks", {}) or {}
+        crop_box    = states.get("crop_box", None)
+
         if preview is not None:
-            local_masks = states.get("masks", {})
-            crop_box    = states.get("crop_box", None)
             try:
                 full_masks = _place_masks_fullframe(local_masks, crop_box, pkt.color.shape[0], pkt.color.shape[1])
-                preview.update_objects(
-                    {"untouched": states.get("untouched", {}), "checking": states.get("checking", {})},
-                    masks=full_masks
+                # 🔑 Normalize/expand to legend keys so circles render correctly
+                unt_norm, chk_norm = _expand_states_for_preview(
+                    states.get("untouched", {}),
+                    states.get("checking", {}),
+                    full_masks
                 )
+                preview.update_objects({"untouched": unt_norm, "checking": chk_norm}, masks=full_masks)
             except Exception:
                 # keep preview resilient
                 pass
 
         # Trigger updates (no overlay pop for object trigger by design)
         if trigger is not None and hasattr(oi, "untouched_out"):
-            pct = win.pct_untouched(getattr(oi, "obj_order", list(local_masks.keys())))
-            stl = win.latest_state_label(getattr(oi, "obj_order", list(local_masks.keys())))
+            # obj_order for trigger can follow OI’s own naming
+            order_for_trigger = getattr(oi, "obj_order", list(local_masks.keys()))
+            pct = win.pct_untouched(order_for_trigger)
+            _ = win.latest_state_label(order_for_trigger)  # stl kept if you need it for debugging
 
-            thr = OBJECT_TRIGGER_MIN_PCT if OBJECT_TRIGGER_MIN_PCT <= 1.0 else (OBJECT_TRIGGER_MIN_PCT / 100.0)
-            good_objs = [o for o, p in pct.items() if p >= thr]
-            signal_good = (len(good_objs) in (2, 3))
+            # threshold currently unused for the trigger decision (kept for debug/telemetry)
+            _thr = OBJECT_TRIGGER_MIN_PCT if OBJECT_TRIGGER_MIN_PCT <= 1.0 else (OBJECT_TRIGGER_MIN_PCT / 100.0)
             elapsed_s = (t_abs - t0) if t0 is not None else 0.0
 
             try:
+                # 🔁 Merge confirmed + live-open spans so the trigger sees ongoing intervals
+                if hasattr(oi, "get_untouched_spans_for_trigger"):
+                    merged_spans = oi.get_untouched_spans_for_trigger(int(pkt.frame_id))
+                else:
+                    merged_spans = getattr(oi, "untouched_out", {})
+
                 trigger.update(
                     cam_label=cam_label,
                     elapsed_time_s=elapsed_s,
                     frame_idx=int(pkt.frame_id),
-                    fps=30.0,  # cadence window math; not used for overlay here
-                    untouched_out=getattr(oi, "untouched_out", {}),
+                    fps=30.0,  # cadence window math
+                    untouched_out=merged_spans,
                     preview_grid=None,
                 )
             except Exception:
