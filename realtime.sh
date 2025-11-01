@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# realtime.sh — Interactive wrapper for realtime_capture.py (movement + emotion)
+# realtime.sh — Interactive wrapper for realtime_capture.py (movement + emotion + object trigger)
 # Simplified: only main run arguments are interactive; rest under advanced controls.
 
 set -euo pipefail
@@ -50,7 +50,7 @@ ask_yn() { local p="$1"; local d="${2:-y}"; local a; while true; do a="$(ask "$p
 cat <<'BANNER'
 ────────────────────────────────────────────────────────────────
    Real-Time Unified Pipeline — Interactive Launcher
-   (captures all cams; selectively process Movement and/or Emotion)
+   (captures all cams; selectively process Movement, Emotion, Object triggers)
 ────────────────────────────────────────────────────────────────
 Controls during run:
   • SPACE  → Pause/Resume
@@ -79,12 +79,25 @@ echo "  - Comma-separated labels (e.g., cam3 or cam1,cam2)"
 echo "  - Enter 'none' to disable"
 PROC_EMO_INPUT="$(ask "Emotion cams" "cam1")"
 
+echo
+echo "Which camera(s) to PROCESS for OBJECT TRIGGERS?"
+echo "  - Comma-separated labels (e.g., cam2 or cam1,cam3)"
+echo "  - Enter 'none' to disable"
+PROC_OBJ_INPUT="$(ask "Object trigger cams" "cam2")"   # ← NEW
+
 EVENT_CHECKER_ENABLE="$(ask_yn "Enable R0 expected-speed event checker?" "y")"
-# Heads-up for where logs will land (per-cam), and the ref CSV (from tunables.py inside Python)
+OBJ_TRIGGER_ENABLE="$(ask_yn "Enable object untouched trigger?" "y")"
+
+# Heads-up for where logs will land
 if [[ "${EVENT_CHECKER_ENABLE,,}" == "y" ]]; then
   echo "[INFO] Speed-trigger: ENABLED → per-cam logs at <cam_dir>/logs/speed_trigger.txt"
 else
   echo "[INFO] Speed-trigger: DISABLED"
+fi
+if [[ "${OBJ_TRIGGER_ENABLE,,}" == "y" ]]; then
+  echo "[INFO] Object-trigger: ENABLED → logs at <output_dir>/logs/object_trigger.txt"
+else
+  echo "[INFO] Object-trigger: DISABLED"
 fi
 
 ADVANCED="$(ask_yn "Show advanced controls?" "n")"
@@ -140,7 +153,6 @@ IFS=',' read -r -a MOV_ARR <<<"${PROC_MOV_INPUT// /}"
 if [[ "${PROC_MOV_INPUT,,}" != "none" && "${PROC_MOV_INPUT,,}" != "all" ]]; then
   CMD+=("--process-mov-cams" "${MOV_ARR[@]}")
 elif [[ "${PROC_MOV_INPUT,,}" == "none" ]]; then
-  # Explicitly pass the flag with no values → argparse sees [] (no movement processing)
   CMD+=("--process-mov-cams")
 fi
 
@@ -150,6 +162,12 @@ if [[ "${PROC_EMO_INPUT,,}" != "none" && "${PROC_EMO_INPUT,,}" != "" ]]; then
   CMD+=("--process-emo-cams" "${EMO_ARR[@]}")
 fi
 
+# Object trigger cams  ← NEW
+IFS=',' read -r -a OBJ_ARR <<<"${PROC_OBJ_INPUT// /}"
+if [[ "${PROC_OBJ_INPUT,,}" != "none" && "${PROC_OBJ_INPUT,,}" != "" ]]; then
+  CMD+=("--process-obj-cams" "${OBJ_ARR[@]}")
+fi
+
 # Audio controls
 if [[ "$AUDIO_ENABLE" == "y" ]]; then
   CMD+=("--audio-out" "$AUDIO_OUT" "--audio-duration-sec" "$AUDIO_DUR" "--rate" "$RATE")
@@ -157,9 +175,12 @@ else
   CMD+=("--audio-duration-sec" "0")
 fi
 
-# Event checker toggle
+# Event checker toggles
 if [[ "${EVENT_CHECKER_ENABLE,,}" != "y" ]]; then
   CMD+=("--no-event-checker")
+fi
+if [[ "${OBJ_TRIGGER_ENABLE,,}" != "y" ]]; then
+  CMD+=("--no-object-trigger")
 fi
 
 # ─────────────────────────── Summary ───────────────────────────
@@ -171,7 +192,9 @@ echo "Save-every (raw)  : $SAVE_EVERY"
 echo "Live preview      : $VIZ_LIVE"
 echo "Movement cams     : $PROC_MOV_INPUT"
 echo "Emotion cams      : $PROC_EMO_INPUT"
-echo "Event checker     : $([[ "${EVENT_CHECKER_ENABLE,,}" == "y" ]] && echo "ENABLED (per-cam speed_trigger.txt)" || echo "DISABLED")"
+echo "Object cams       : $PROC_OBJ_INPUT"
+echo "Speed-trigger     : $([[ "${EVENT_CHECKER_ENABLE,,}" == "y" ]] && echo "ENABLED" || echo "DISABLED")"
+echo "Object-trigger    : $([[ "${OBJ_TRIGGER_ENABLE,,}" == "y" ]] && echo "ENABLED" || echo "DISABLED")"
 if [[ "$ADVANCED" == "y" ]]; then
   echo "Depth filters     : $FILTERS"
   echo "Flip baseline     : $FORCE_FLIP"

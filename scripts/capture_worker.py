@@ -59,10 +59,11 @@ def capture_worker(
     q_mov: Optional["pyqueue.Queue[FramePacket]"],
     q_emo: Optional["pyqueue.Queue[FramePacket]"],
     backpressure: str,
+    q_obj: Optional["pyqueue.Queue[FramePacket]"] = None,  # ✅ NEW (optional)
 ):
     """
     Captures color+depth from a RealSense, aligns depth to color, optionally filters,
-    publishes FramePacket(s) to movement / emotion queues, and optionally saves raw frames.
+    publishes FramePacket(s) to movement / emotion / object queues, and optionally saves raw frames.
     Honors global pause/stop (SPACE / ESC) via control_flags.
     """
 
@@ -110,7 +111,11 @@ def capture_worker(
 
     # Prefer cam2's scale for others if available; ensure fallback constant
     with _CAM2_DEPTH_SCALE_LOCK:
+        global _CAM2_DEPTH_SCALE
         if cam_label == "cam2":
+            # If cam2's reported scale is invalid, fall back and publish the fallback
+            if (depth_scale_m is None) or (depth_scale_m <= 0):
+                depth_scale_m = FALLBACK_DEPTH_SCALE
             _CAM2_DEPTH_SCALE = depth_scale_m
         else:
             if (depth_scale_m is None) or (depth_scale_m <= 0):
@@ -260,6 +265,7 @@ def capture_worker(
             )
             _safe_put(q_mov, pkt, backpressure)
             _safe_put(q_emo, pkt, backpressure)
+            _safe_put(q_obj, pkt, backpressure)  # ✅ NEW: feed object lane
 
             frame_id += 1
 

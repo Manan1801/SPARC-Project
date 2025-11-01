@@ -3,39 +3,7 @@
 event_triggers.py
 
 Central place for trigger checks, flagging, and logging while capture/processing runs.
-
-CURRENTLY IMPLEMENTED TRIGGER
-----------------------------
-1) Right-hand wrist movement speed trigger:
-   - current_avg_speed = cumulative_movement_upto_now / elapsed_time_s
-   - Compare against [lower_bound, upper_bound] from a reference CSV with headers:
-         time_s, lower_bound, upper_bound
-     Bounds are picked using the latest row with time_s <= elapsed_time_s
-     (falls back to first/last row when out-of-range).
-
-   - If value < lower_bound  -> "LOW SPEED" (bad)
-     If value > upper_bound  -> "HIGH SPEED" (bad)
-     Else                    -> "GOOD" (no flag)
-
-CADENCE / THROTTLING
---------------------
-- To avoid log spam, we only raise/log at most once per "cadence window" slot:
-      slot_index = floor(elapsed_time_s / SPEED_TRIGGER_CADENCE_WINDOW_S)
-- Within a slot, we log the *first* bad status and show a PreviewGrid overlay.
-- Good status is still returned but not logged.
-
-LOGGING
--------
-- Logs are centralized via logger_utils.DebouncedLogger.
-- By default, a per-cam logger (cam_dir/logs/speed_trigger.txt) is created via
-  logger_utils.get_speed_trigger_logger(cam_dir), unless a custom logger is injected.
-- We DO NOT write files directly here; no duplicate writes.
-
-PREVIEW GRID OVERLAY
---------------------
-- If a PreviewGrid instance is provided, we attempt to call:
-      preview_grid.annotate_event(cam_label, kind, text, ttl_s)
-  If that method doesn't exist, we safely no-op.
+(Existing RightWristSpeedTrigger kept; ObjectUntouchedTrigger updated per spec.)
 """
 
 from __future__ import annotations
@@ -44,22 +12,27 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 from tunables import (
     SPEED_TRIGGER_CADENCE_WINDOW_S,
     SPEED_TRIGGER_REFCSV_PATH,
-    SPEED_TRIGGER_OVERLAY_TTL_S,
+    SPEED_TRIGGER_OVERLAY_TTL_S,  # still used by speed trigger
+    OBJECT_TRIGGER_WINDOW_SEC,     # ← window length used for object trigger
 )
 
-# centralized logger
-from logger_utils import DebouncedLogger, get_speed_trigger_logger
+from logger_utils import (
+    DebouncedLogger,
+    get_speed_trigger_logger,
+    get_object_trigger_logger,  # logs to <cam>/logs/object_trigger
+)
 
 # --------------------------- Utilities ---------------------------
 
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
 
+# (speed trigger still uses preview overlays via annotate_event)
 def _notify_preview_grid(preview_grid, cam_label: str, text: str, kind: str = "speed",
                          ttl_s: float = SPEED_TRIGGER_OVERLAY_TTL_S) -> None:
     if preview_grid is None:
@@ -122,25 +95,9 @@ class BaseTrigger:
         pass
 
 
-# ---------------------- Right Wrist Speed Trigger -------------------
+# ---------------------- Right Wrist Speed Trigger (unchanged) -------------------
 
 class RightWristSpeedTrigger(BaseTrigger):
-    """
-    Checks current average speed against time-indexed bounds.
-    Throttles logging to one BAD event per cadence slot.
-
-    update(...) returns a dict:
-        {
-          "good": bool,
-          "reason": "good"|"low"|"high",
-          "value": float,
-          "lower": float,
-          "upper": float,
-          "slot": int,
-          "elapsed_s": float,
-        }
-    """
-
     def __init__(self,
                  movement_cam_dir: Path,
                  cam_label: str,
@@ -157,11 +114,7 @@ class RightWristSpeedTrigger(BaseTrigger):
         ref_path = Path(reference_csv) if reference_csv else Path(SPEED_TRIGGER_REFCSV_PATH)
         self.ref = ReferenceBounds(ref_path)
 
-        # Logging: use injected centralized logger if provided,
-        # else create a per-cam speed-trigger logger via logger_utils.
         self.logger: DebouncedLogger = logger if logger is not None else get_speed_trigger_logger(self.movement_cam_dir)
-
-        # internal cadence state
         self._last_bad_slot_logged: Optional[int] = None
 
     def reset(self):
@@ -179,7 +132,6 @@ class RightWristSpeedTrigger(BaseTrigger):
 
     def _format_line(self, *, ts_s: float, frame_idx: int, slot: int,
                      status: str, value: float, lo: float, hi: float) -> str:
-        # E.g. "2025-10-30T23:59:12 ts=12.33 frame=370 slot=4 status=HIGH value=1.234 lo=0.800 hi=1.100 cam=cam2"
         return (f"{_iso_now()} ts={ts_s:.3f} frame={frame_idx} slot={slot} "
                 f"status={status.upper()} value={value:.6f} lo={lo:.6f} hi={hi:.6f} cam={self.cam_label}")
 
@@ -189,63 +141,162 @@ class RightWristSpeedTrigger(BaseTrigger):
                frame_idx: int,
                cumulative_movement: float,
                preview_grid=None) -> dict:
-        # Guard for early frames
         if elapsed_time_s <= 0:
-            return {
-                "good": True,
-                "reason": "good",
-                "value": 0.0,
-                "lower": float("nan"),
-                "upper": float("nan"),
-                "slot": self._slot_index(0.0),
-                "elapsed_s": 0.0,
-            }
+            return {"good": True, "reason": "good", "value": 0.0,
+                    "lower": float("nan"), "upper": float("nan"),
+                    "slot": self._slot_index(0.0), "elapsed_s": 0.0}
 
-        # 1) current average speed
         cur_avg_speed = float(cumulative_movement) / float(elapsed_time_s)
-
-        # 2) bounds for this time
         lo, hi = self.ref.get_bounds(elapsed_time_s)
-
-        # 3) judge
         good, reason = self._judge(cur_avg_speed, lo, hi)
-
-        # 4) cadence slot
         slot = self._slot_index(elapsed_time_s)
 
-        # 5) decide logging/overlay
-        if not good:
-            # Only one BAD log per slot
-            if self._last_bad_slot_logged != slot:
-                line = self._format_line(
-                    ts_s=elapsed_time_s,
-                    frame_idx=frame_idx,
-                    slot=slot,
-                    status=("LOW" if reason == "low" else "HIGH"),
-                    value=cur_avg_speed,
-                    lo=lo,
-                    hi=hi,
-                )
-                try:
-                    self.logger.info(line)
-                    self.logger.periodic_flush()
-                except Exception:
-                    pass
-                self._last_bad_slot_logged = slot
+        if not good and self._last_bad_slot_logged != slot:
+            line = self._format_line(ts_s=elapsed_time_s, frame_idx=frame_idx, slot=slot,
+                                     status=("LOW" if reason == "low" else "HIGH"),
+                                     value=cur_avg_speed, lo=lo, hi=hi)
+            try:
+                self.logger.info(line); self.logger.periodic_flush()
+            except Exception:
+                pass
+            self._last_bad_slot_logged = slot
+            _notify_preview_grid(preview_grid, self.cam_label,
+                                 "Low Speed" if reason == "low" else "High Speed",
+                                 kind="speed")
 
-                # UI overlay: "Low Speed" or "High Speed" for few seconds
-                overlay_text = "Low Speed" if reason == "low" else "High Speed"
-                _notify_preview_grid(preview_grid, self.cam_label, overlay_text,
-                                     kind="speed", ttl_s=self.overlay_ttl_s)
+        return {"good": good, "reason": reason, "value": cur_avg_speed,
+                "lower": lo, "upper": hi, "slot": slot, "elapsed_s": elapsed_time_s}
+
+
+# ---------------------- Object Untouched Trigger (UPDATED) -------------------
+
+class ObjectUntouchedTrigger(BaseTrigger):
+    """
+    GOOD iff within the current cadence window (length W = OBJECT_TRIGGER_WINDOW_SEC),
+    the number of objects whose untouched coverage ≥ 90% of W is in {2, 3}.
+    Otherwise BAD.
+
+    Expects confirmed untouched intervals as:
+        untouched_out = { obj_name: [[start_f, end_f], ...], ... }
+
+    update(...) returns:
+        {
+          "good": bool,
+          "qualified_count": int,
+          "per_object_sec": {obj: seconds_in_window},
+          "per_object_pct": {obj: percentage_of_window},
+          "per_object_state": {obj: 'untouched'|'other'},  # at window end
+          "slot": int,
+          "window_start_s": float,
+          "window_end_s": float,
+        }
+    """
+    def __init__(self,
+                 cam_dir: Path,
+                 cam_label: Optional[str] = None,                 # ← now optional for compatibility
+                 cadence_window_s: float = OBJECT_TRIGGER_WINDOW_SEC,
+                 logger: Optional[DebouncedLogger] = None):
+        super().__init__("objects_untouched")
+        self.cam_label = cam_label or "(unknown)"
+        self.cam_dir = Path(cam_dir)
+        self.W = float(max(0.5, cadence_window_s))
+        # Threshold is always 90% of the window (per spec)
+        self.tol_thresh = 0.9 * self.W
+        self.logger: DebouncedLogger = logger if logger is not None else get_object_trigger_logger(self.cam_dir)
+        self._last_slot_logged: Optional[int] = None
+
+    def reset(self):
+        self._last_slot_logged = None
+
+    def _slot_index(self, elapsed_s: float) -> int:
+        return int(math.floor(elapsed_time_s / self.W))
+
+    def _slot_bounds(self, slot_idx: int) -> Tuple[float, float]:
+        start_s = slot_idx * self.W
+        end_s = (slot_idx + 1) * self.W
+        return start_s, end_s
+
+    @staticmethod
+    def _overlap_len(a0: int, a1: int, b0: int, b1: int) -> int:
+        # inclusive frame intervals [a0,a1], [b0,b1]
+        lo = max(a0, b0)
+        hi = min(a1, b1)
+        return max(0, hi - lo + 1)
+
+    @staticmethod
+    def _contains_frame(spans: List[List[int]], f: int) -> bool:
+        for s, e in spans:
+            if s <= f <= e:
+                return True
+        return False
+
+    def update(self,
+               *,
+               elapsed_time_s: float,
+               frame_idx: int,
+               fps: float,
+               untouched_out: Dict[str, List[List[int]]],
+               preview_grid=None) -> dict:
+        # NOTE: object trigger does NOT pop any preview overlay (per spec).
+        slot = self._slot_index(elapsed_time_s)
+        win_s, win_e = self._slot_bounds(slot)
+        win_f0 = int(math.floor(win_s * fps))
+        win_f1 = int(math.floor(win_e * fps)) - 1  # inclusive end frame
+        window_len_s = self.W
+
+        per_obj_sec: Dict[str, float] = {}
+        per_obj_pct: Dict[str, float] = {}
+        per_obj_state: Dict[str, str] = {}
+
+        qualified = 0
+
+        for obj, spans in untouched_out.items():
+            # 1) Coverage (frames→seconds) inside this window
+            total_frames = 0
+            for s, e in spans:
+                total_frames += self._overlap_len(s, e, win_f0, win_f1)
+            sec = total_frames / float(max(1.0, fps))
+            per_obj_sec[obj] = sec
+            pct = (sec / window_len_s) * 100.0 if window_len_s > 0 else 0.0
+            per_obj_pct[obj] = pct
+
+            # 2) State at the window end
+            end_state = "untouched" if self._contains_frame(spans, win_f1) else "other"
+            per_obj_state[obj] = end_state
+
+            # 3) Qualification (≥ 90% of window)
+            if sec >= self.tol_thresh:
+                qualified += 1
+
+        good = (2 <= qualified <= 3)
+
+        # Log once per slot with full per-object breakdown
+        if self._last_slot_logged != slot:
+            status = "GOOD" if good else "BAD"
+            obj_chunks = []
+            for obj in sorted(per_obj_sec.keys()):
+                obj_chunks.append(
+                    f"{obj}: sec={per_obj_sec[obj]:.2f} pct={per_obj_pct[obj]:.1f}% state={per_obj_state[obj]}"
+                )
+            obj_str = " | ".join(obj_chunks)
+            line = (f"{_iso_now()} t={elapsed_time_s:.3f} slot={slot} "
+                    f"win=[{win_s:.1f},{win_e:.1f}) signal={status} qualified={qualified} "
+                    f"tol90={self.tol_thresh:.2f}s cam={self.cam_label} || {obj_str}")
+            try:
+                self.logger.info(line); self.logger.periodic_flush()
+            except Exception:
+                pass
+            self._last_slot_logged = slot
 
         return {
             "good": good,
-            "reason": reason,           # "good" | "low" | "high"
-            "value": cur_avg_speed,     # current average
-            "lower": lo,
-            "upper": hi,
+            "qualified_count": qualified,
+            "per_object_sec": per_obj_sec,
+            "per_object_pct": per_obj_pct,
+            "per_object_state": per_obj_state,
             "slot": slot,
-            "elapsed_s": elapsed_time_s,
+            "window_start_s": win_s,
+            "window_end_s": win_e,
         }
 
 

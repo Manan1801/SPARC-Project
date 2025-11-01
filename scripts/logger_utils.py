@@ -5,7 +5,7 @@ logger_utils.py — centralized, debounced, thread-safe logging with factories.
 import atexit
 import time
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, Dict
 import threading
 from datetime import datetime
 
@@ -123,9 +123,49 @@ def get_preview_logger(out_dir: Path, *, flush_sec: int = 5, debug: bool = False
 def get_speed_trigger_logger(cam_dir: Path, *, flush_sec: int = 5, debug: bool = False, tee: bool = False) -> DebouncedLogger:
     return _mk_logger(Path(cam_dir) / "logs" / "speed_trigger.txt", flush_sec, debug, tee)
 
+# NEW: per-cam object-untouched trigger logger (no extension per spec)
+def get_object_trigger_logger(cam_dir: Path, *, flush_sec: int = 5, debug: bool = False, tee: bool = False) -> DebouncedLogger:
+    return _mk_logger(Path(cam_dir) / "logs" / "object_trigger", flush_sec, debug, tee)
+
 # ───────────────────────── Convenience helpers ───────────────────────
 def log_exception(logger: DebouncedLogger, prefix: str, exc: BaseException):
     try:
         logger.error(f"{prefix}: {exc.__class__.__name__}: {exc}")
     except Exception:
         pass
+
+def log_untouched_intervals_text(
+    out_dir: Path,
+    untouched_out: Dict[str, List[List[int]]],
+    filename: str = "untouched_intervals_xyz.txt"
+) -> str:
+    """
+    Write the untouched-intervals text file in the exact format used in the
+    offline script, centralized here for reuse.
+
+    Output format:
+        📌 Untouched intervals (confirmed):
+        red: [a, b], [c, d]
+        green: None
+        ...
+
+    Returns the absolute path to the written file.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / filename
+
+    lines: List[str] = ["📌 Untouched intervals (confirmed):"]
+    for obj, spans in untouched_out.items():
+        if not spans:
+            lines.append(f"{obj}: None")
+        else:
+            parts = [f"[{a}, {b}]" for a, b in spans]
+            lines.append(f"{obj}: {', '.join(parts)}")
+
+    try:
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    return str(path)

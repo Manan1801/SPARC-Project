@@ -25,9 +25,9 @@ class PreviewGrid:
         self.emo_frame = None
 
         # Movement (cumulative) history + timestamps
-        self.r0_cum_hist = deque(maxlen=self.history_len)     # floats
-        self.r0_time_hist = deque(maxlen=self.history_len)    # float monotonic timestamps
-        self._t0_plot = None                                  # first timestamp
+        self.r0_cum_hist = deque(maxlen=self.history_len)
+        self.r0_time_hist = deque(maxlen=self.history_len)
+        self._t0_plot = None
         self.r0_last_avg_speed = 0.0
 
         # Affect history
@@ -35,12 +35,17 @@ class PreviewGrid:
 
         self.logger = logger or get_preview_logger(Path("."))
 
-        # Total duration to lock X-axis (auto-read from argv so you don't change other scripts)
+        # Total duration to lock X-axis
         self.total_duration_sec = self._guess_total_duration_from_argv() if total_duration_sec is None else float(max(1.0, total_duration_sec))
 
-        # Short-lived badges and persistent event marks (absolute times, keep text for color parity)
-        self._active_events = []   # {"text": str, "kind": str, "expires": float}
-        self._event_marks = []     # {"t_abs": float, "kind": str, "text": str}
+        # Short-lived badges and persistent event marks
+        self._active_events = []
+        self._event_marks = []
+
+        # ── NEW: per-frame object state and masks (for overlay)
+        self._obj_states = {"untouched": {}, "checking": {}}
+        self._obj_masks = {}     # {obj: np.ndarray mask (binary 0/255), ROI-sized or full-frame}
+        self._obj_crop_box = None  # (x_min, y_min, x_max, y_max) in movement-frame coords
 
     def _guess_total_duration_from_argv(self, default: float = 60.0) -> float:
         try:
@@ -92,7 +97,6 @@ class PreviewGrid:
         try: self.logger.info("Preview window stopped")
         finally: self.logger.periodic_flush(force=True)
 
-    # optional setter (not required by launcher)
     def set_total_duration(self, duration_sec: float):
         with self.lock:
             self.total_duration_sec = float(max(1.0, duration_sec))
@@ -127,14 +131,158 @@ class PreviewGrid:
         with self.lock:
             self._active_events = [e for e in self._active_events if e["expires"] > now]
             self._active_events.append({"text": str(text), "kind": str(kind), "expires": exp})
-            # keep text so marker color matches badge wording
             self._event_marks.append({"t_abs": now, "kind": str(kind), "text": str(text)})
+
+    # --- NEW: called by object worker each frame ---
+    def update_objects(self, states: dict, masks: dict | None = None, crop_box: tuple | None = None):
+        """states = {'untouched': {obj: bool}, 'checking': {obj: bool}}
+           masks  = {obj: mask (uint8), ROI-sized or full-frame}
+           crop_box = (x_min, y_min, x_max, y_max) in movement-frame coords (optional)"""
+        with self.lock:
+            self._obj_states = {
+                "untouched": dict(states.get("untouched", {})),
+                "checking": dict(states.get("checking", {})),
+            }
+            if masks:
+                self._obj_masks = {k: v.copy() for k, v in masks.items() if v is not None}
+            else:
+                self._obj_masks.clear()
+            self._obj_crop_box = tuple(crop_box) if crop_box is not None else None
 
     def _maybe_set_cell_size(self, img):
         h, w = img.shape[:2]
         maxw = 640
         scale = min(1.0, maxw / float(w)) if w > 0 else 1.0
         self.cell_w, self.cell_h = int(w * scale), int(h * scale)
+
+    # ---------- object legend + mask overlay ----------
+    def _overlay_object_masks(self, img_full):
+        """Overlay semi-transparent colored object masks on the ORIGINAL movement frame (pre-resize),
+        byte-aligned with the renderer behavior."""
+        if img_full is None:
+            return
+        with self.lock:
+            masks = dict(self._obj_masks)
+            crop_box = self._obj_crop_box
+        if not masks:
+            return
+
+        # BGR colors exactly as renderer
+        colors = {
+            "red":      (0, 0, 255),
+            "green":    (0, 255, 0),
+            "gray":     (255, 255, 255),
+            "yellow_1": (0, 255, 255),
+            "yellow_2": (0, 128, 255),
+            "gold":     (128, 0, 255),
+        }
+        objects = list(colors.keys())
+
+        if crop_box:
+            x_min, y_min, x_max, y_max = crop_box
+            crop_w, crop_h = x_max - x_min, y_max - y_min
+
+            for obj in objects:
+                m = masks.get(obj)
+                if m is None:
+                    continue
+
+                # If mask shape mismatches crop size, attempt to fallback crop or skip
+                if m.shape[:2] != (crop_h, crop_w):
+                    # If mask is full-frame we can crop
+                    if m.shape[0] >= y_max and m.shape[1] >= x_max:
+                        # crop to ROI
+                        m = m[y_min:y_max, x_min:x_max]
+                    else:
+                        # warn and skip (same message style as renderer)
+                        # tqdm.write(f"[warn] mask size mismatch {obj}: {m.shape} vs {(crop_h, crop_w)} -- skipping")
+                        continue
+
+                color = colors.get(obj, (255, 255, 255))
+
+                # create colored fill image for the ROI
+                colored_roi = np.zeros((crop_h, crop_w, 3), dtype=np.uint8)
+                colored_roi[m > 0] = color
+
+                # Put ROI onto overlay using alpha blending (entire ROI)
+                roi = img_full[y_min:y_max, x_min:x_max]
+                blended = cv2.addWeighted(roi, 1.0, colored_roi, 0.4, 0)
+
+                # draw contour (outline of largest component)
+                contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    c = max(contours, key=cv2.contourArea)
+                    cv2.drawContours(blended, [c], -1, color, thickness=2)
+
+                img_full[y_min:y_max, x_min:x_max] = blended
+
+        else:
+            # Full-frame fallback mirrors renderer semantics
+            H, W = img_full.shape[:2]
+            for obj in objects:
+                m = masks.get(obj)
+                if m is None:
+                    continue
+
+                # If mask isn't full-frame size, skip (renderer only knows ROI/full-frame)
+                if m.shape[:2] != (H, W):
+                    # tqdm.write(f"[warn] mask size mismatch {obj}: {m.shape} vs {(H, W)} -- skipping")
+                    continue
+
+                color = colors.get(obj, (255, 255, 255))
+                colored = np.zeros((H, W, 3), dtype=np.uint8)
+                colored[m > 0] = color
+
+                blended = cv2.addWeighted(img_full, 1.0, colored, 0.4, 0)
+
+                contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    c = max(contours, key=cv2.contourArea)
+                    cv2.drawContours(blended, [c], -1, color, thickness=2)
+
+                img_full[:] = blended
+
+    def _draw_transparent_circle(self, img_bgr, center, radius, color_bgr, alpha=0.45, outline=True):
+        overlay = img_bgr.copy()
+        cv2.circle(overlay, center, radius, color_bgr, thickness=-1)
+        cv2.addWeighted(overlay, alpha, img_bgr, 1 - alpha, 0, dst=img_bgr)
+        if outline:
+            cv2.circle(img_bgr, center, radius, color_bgr, 1)
+
+    def _render_object_legend(self, img):
+        """Overlay vertical legend of per-object states on the movement image."""
+        if img is None:
+            return
+        order = ["red", "green", "gray", "yellow_1", "yellow_2", "gold"]
+        colors = {
+            "red": (0, 0, 255),
+            "green": (0, 255, 0),
+            "gray": (255, 255, 255),
+            "yellow_1": (0, 255, 255),
+            "yellow_2": (0, 128, 255),
+            "gold": (128, 0, 255),
+        }
+        with self.lock:
+            unt = dict(self._obj_states.get("untouched", {}))
+            chk = dict(self._obj_states.get("checking", {}))
+        radius = 8
+        start_x = 20
+        start_y = 60
+        vspacing = 28
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for i, obj in enumerate(order):
+            cx = start_x
+            cy = start_y + i * vspacing
+            color = colors.get(obj, (255, 255, 255))
+            is_check = bool(chk.get(obj, False))
+            is_un = bool(unt.get(obj, False))
+            if is_check:
+                self._draw_transparent_circle(img, (cx, cy), radius, color, alpha=0.45, outline=True)
+            elif is_un:
+                cv2.circle(img, (cx, cy), radius, color, -1)
+            else:
+                cv2.circle(img, (cx, cy), radius, color, 2)
+            cv2.putText(img, obj, (cx + radius + 8, cy + 5), font, 0.5, color, 1, cv2.LINE_AA)
 
     # ---------- badges ----------
     def _badge(self, img, text, corner="tl", pad=8, opacity=0.4):
@@ -270,7 +418,6 @@ class PreviewGrid:
             t_e = float(np.clip(m["t_abs"] - t0, 0.0, elapsed))
             # locate closest sample
             if times:
-                # pick index by nearest time
                 diffs = np.abs(np.array(times) - (t0 + t_e))
                 idx = int(np.argmin(diffs))
                 v_e = float(vals[idx])
@@ -324,7 +471,18 @@ class PreviewGrid:
         def fit(img):
             if img is None: return np.zeros((self.cell_h, self.cell_w, 3), np.uint8)
             return cv2.resize(img, (self.cell_w, self.cell_h))
-        tl, tr, bl, br = map(fit, (hand, emo, mov_plot, va_plot))
+
+        # IMPORTANT: do mask overlay on the ORIGINAL hand frame, then resize
+        hand_proc = None if hand is None else hand.copy()
+        if hand_proc is not None:
+            self._overlay_object_masks(hand_proc)   # apply ROI/full-frame masks
+            self._render_object_legend(hand_proc)   # then draw legend
+
+        tl = fit(hand_proc) if hand_proc is not None else fit(hand)
+        tr = fit(emo)
+        bl = fit(mov_plot)
+        br = fit(va_plot)
+
         self._badge(tl, "Movement Camera", "tr")
         self._badge(tr, "Emotion Camera", "tr")
         self._badge(bl, "Cumulative R_0", "bl")
@@ -335,7 +493,6 @@ class PreviewGrid:
         grid[self.cell_h:, 0:self.cell_w] = bl
         grid[self.cell_h:, self.cell_w:] = br
 
-        # Short-lived event badge (most recent)
         now = time.monotonic()
         with self.lock:
             self._active_events = [e for e in self._active_events if e["expires"] > now]
