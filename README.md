@@ -27,23 +27,23 @@ SPARC-Project/
 ├── camera_serials.txt                  # Known RealSense serials
 └── sync-data-collection/
 └── scripts/
-├── realtime_capture.py         # Main orchestrator
-├── capture_worker.py           # Camera threads
-├── camera_utils.py             # Camera discovery & serial mapping
-├── movement_processor.py       # Hand & movement analysis
-├── emotion_processor.py        # Face & valence–arousal mapping
-├── emotion_mapping.py          # Emotion mapping helpers
-├── object_worker.py            # Object tracking + COM logic
-├── object_interaction.py       # Object detection & states
-├── event_triggers.py           # Speed & untouched triggers
-├── preview_grid.py             # Unified live preview grid
-├── ros_publisher_node.py       # ROS 2 trigger publisher
-├── projection.py               # RGB→Depth projection utilities
-├── hand_utils.py               # MediaPipe Hands helpers
-├── logger_utils.py             # Debounced logging utilities
-├── control_flags.py            # Shared pause/stop events
-├── tunables.py                 # Centralized constants & parameters
-└── types_shared.py             # Shared data structures
+    ├── realtime_capture.py         # Main orchestrator
+    ├── capture_worker.py           # Camera threads
+    ├── camera_utils.py             # Camera discovery & serial mapping
+    ├── movement_processor.py       # Hand & movement analysis
+    ├── emotion_processor.py        # Face & valence–arousal mapping
+    ├── emotion_mapping.py          # Emotion mapping helpers
+    ├── object_worker.py            # Object tracking + COM logic
+    ├── object_interaction.py       # Object detection & states
+    ├── event_triggers.py           # Speed & untouched triggers
+    ├── preview_grid.py             # Unified live preview grid
+    ├── ros_publisher_node.py       # ROS 2 trigger publisher
+    ├── projection.py               # RGB→Depth projection utilities
+    ├── hand_utils.py               # MediaPipe Hands helpers
+    ├── logger_utils.py             # Debounced logging utilities
+    ├── control_flags.py            # Shared pause/stop events
+    ├── tunables.py                 # Centralized constants & parameters
+    └── types_shared.py             # Shared data structures
 
 ````
 
@@ -140,16 +140,19 @@ Confirm the summary → press **Enter** to launch.
 ```
 run_YYYYMMDD_HHMMSS/
 ├── cam1/
-│   ├── color/ , depth/ , preview/
-│   ├── csv/
+│   ├── color/ , depth/ 
+│   ├── CSV/
 │   │   ├── movement_landmarks.csv
 │   │   ├── movement_xyz.csv
 │   │   └── emotion.csv
-│   └── logs/speed_trigger.txt
+│   └── logs/emotion_trigger.txt
 ├── cam2/ … (same pattern)
-├── logs/object_trigger.txt
-├── audio/mic_*.wav
-└── meta/run_config.json
+│   └── logs/
+│       ├── object_trigger.txt
+│       └── speed_trigger.txt
+├── cam3/ … (same pattern)
+└── audio/mic_*.wav
+
 ```
 
 ---
