@@ -1,4 +1,4 @@
-```markdown
+
 # 🧠 SPARC Real-Time Unified Pipeline  
 **Multi-Camera • Hand Movement • Emotion • Object Interaction • Event Triggers**
 
@@ -253,7 +253,3 @@ Object-trigger    : ENABLED
 
 Developed as part of the **SPARC Project** 
 IIT Gandhinagar • Robotics Lab 
-
----
-
-```
