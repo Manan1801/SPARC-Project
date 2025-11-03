@@ -54,11 +54,11 @@ SPEED_TRIGGER_OVERLAY_TTL_S = 6.0  # 5–7 seconds as requested
 # ─── Object interaction knobs ───────────────────────────────
 OBJ_REF_FRAME         = 100
 OBJ_P_START           = 30
-OBJ_Q_END             = 30
+OBJ_Q_END             = 60
 OBJ_DEPTH_UNITS       = 0.0010000000474974513
 # IMPORTANT: keep "yellow" (singular) so tracking logic can split to yellow_1/_2 internally
 OBJ_COLORS = ["red", "green", "gray", "yellow", "gold"]  # ✅ changed from explicit _1/_2
 
 # ─── Object trigger thresholds ──────────────────────────────
-OBJECT_TRIGGER_WINDOW_SEC = 30.0
+OBJECT_TRIGGER_WINDOW_SEC = 180.0
 OBJECT_TRIGGER_MIN_PCT = 90.0

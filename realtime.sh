@@ -2,6 +2,9 @@
 # realtime.sh — Interactive wrapper for realtime_capture.py (movement + emotion + object trigger)
 # Simplified: only main run arguments are interactive; rest under advanced controls.
 
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=0
+
 set -euo pipefail
 
 # ───────────────────────── Conda environment ─────────────────────────
@@ -41,6 +44,8 @@ if [[ ! -f "$SCRIPT_PATH" ]]; then
   echo "[ERROR] Script not found at $SCRIPT_PATH"
   exit 1
 fi
+
+
 
 # ────────────────────────────── Helpers ───────────────────────────────
 ask() { local p="$1"; local d="${2:-}"; local r; read -r -p "$p [$d]: " r || true; echo "${r:-$d}"; }

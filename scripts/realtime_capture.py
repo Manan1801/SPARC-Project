@@ -29,6 +29,10 @@ from emotion_processor import emotion_worker
 from object_worker import object_worker  # ✅ NEW
 from camera_utils import load_serial_map
 from audio_worker import audio_worker
+import rclpy
+
+from ros_publisher_node import ROS2PublisherNode
+
 
 # shared control flags
 from control_flags import pause_event, stop_event
@@ -48,6 +52,7 @@ def _sig_stop(signum, frame):
     print("\n[⛔] SIGINT → stopping…", flush=True)
     stop_event.set()
 signal.signal(signal.SIGINT, _sig_stop)
+
 
 
 # --- Terminal keyboard listener (SPACE / 'g' / ESC) ---
@@ -145,225 +150,254 @@ def build_argparser():
 
 
 def main():
-    args = build_argparser().parse_args()
 
-    out_dir = Path(args.output_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Initialize rclpy once, get singleton node
+    node = ROS2PublisherNode.get_instance()
 
-    # Central loggers
-    preview_logger = get_preview_logger(out_dir, flush_sec=max(1, args.log_flush_sec))
+    # Run ROS2 event loop in a background thread (so rest of code runs)
+    spin_thread = threading.Thread(
+        target=rclpy.spin,
+        args=(node,),
+        daemon=True,
+        name="ros2-spin-thread"
+    )
+    spin_thread.start()
 
-    # Discover cams
-    serial_to_label = load_serial_map()
-    ctx = rs.context()
-    connected = [dev.get_info(rs.camera_info.serial_number) for dev in ctx.query_devices()]
-    active = [(s, serial_to_label.get(s, f"cam_{s[-4:]}")) for s in connected]
-    if not active:
-        print("[ERROR] No RealSense cameras found.")
-        return
-    print(f"[INFO] Connected cams: {', '.join([f'{lab}({s})' for s,lab in active])}")
-
-    # Camera selections
-    process_set_mov = set([lab.strip() for lab in (args.process_mov_cams or []) if lab.strip()])
-    process_set_emo = set([lab.strip() for lab in (args.process_emo_cams or []) if lab.strip()])
-    process_set_obj = set([lab.strip() for lab in (args.process_obj_cams or []) if lab.strip()])
-
-    print(f"[INFO] Movement cams: {sorted(process_set_mov) if process_set_mov else 'NONE'}")
-    print(f"[INFO] Emotion cams:  {sorted(process_set_emo) if process_set_emo else 'NONE'}")
-    print(f"[INFO] Object-trigger cams: {sorted(process_set_obj) if process_set_obj else 'NONE'}")
-
-    # Speed trigger
-    if not args.no_event_checker and process_set_mov:
-        try:
-            refcsv = SPEED_TRIGGER_REFCSV_PATH
-        except NameError:
-            refcsv = "(default in trigger)"
-        print(f"[INFO] Speed-trigger checker: ENABLED (reference CSV: {refcsv})")
-    else:
-        print("[INFO] Speed-trigger checker: DISABLED")
-
-    # Object trigger setup
-    obj_trigs = {}
-    if not args.no_object_trigger:
-        if process_set_obj:
-            try:
-                for lab in sorted(process_set_obj):
-                    cam_dir = out_dir / lab
-                    obj_log = get_object_trigger_logger(cam_dir, flush_sec=max(1, args.log_flush_sec))
-                    cam_dir = out_dir / lab
-                    trig = ObjectUntouchedTrigger(cam_dir, cam_label=lab, logger=obj_log)
-                    setattr(trig, "target_cam_labels", [lab])
-                    obj_trigs[lab] = trig
-                print(f"[INFO] Object-trigger checker: ENABLED for {len(obj_trigs)} cam(s): {', '.join(obj_trigs.keys())}")
-            except Exception as e:
-                print(f"[WARN] Object-trigger init failed: {e}")
-        else:
-            print("[INFO] Object-trigger checker: ENABLED but no object cams selected")
-    else:
-        print("[INFO] Object-trigger checker: DISABLED")
-
-    # Unified preview
-    PREVIEW = None
-    if args.viz_live == "on":
-        PREVIEW = PreviewGrid(
-            title="Unified Preview",
-            history_len=max(240, args.emo_history),
-            target_fps=30,
-            logger=preview_logger,
-        )
-        PREVIEW.start()
-        # ✅ ensure the X-axis lock in the cumulative plot matches runtime duration exactly
-        try:
-            PREVIEW.set_total_duration(float(args.duration_sec))
-        except Exception:
-            pass
-
-    _kbd = start_keyboard_listener(PREVIEW)
-
-    # Queues & threads
-    cap_threads, proc_threads = [], []
-    queues_mov: Dict[str, queue.Queue] = {}
-    queues_emo: Dict[str, queue.Queue] = {}
-    queues_obj: Dict[str, queue.Queue] = {}  # ✅ NEW
-    obj_threads = []  # ✅ NEW
-
-    for serial, label in active:
-        q_mov = None
-        q_emo = None
-        q_obj = None  # ✅ NEW
-
-        # Movement
-        if label in process_set_mov:
-            q_mov = queue.Queue(maxsize=8)
-            queues_mov[label] = q_mov
-            t_proc_mov = threading.Thread(
-                target=processor_worker,
-                args=(label, q_mov, out_dir, args.force_flip, max(1, args.stride),
-                      max(1, args.csv_flush), max(1, args.log_flush_sec),
-                      PREVIEW, max(0, args.viz_save_every)),
-                kwargs=dict(event_checker_enabled=(not args.no_event_checker)),
-                daemon=True, name=f"proc-mov-{label}"
-            )
-            t_proc_mov.start()
-            proc_threads.append(t_proc_mov)
-
-        # Emotion
-        if label in process_set_emo:
-            q_emo = queue.Queue(maxsize=8)
-            queues_emo[label] = q_emo
-            t_proc_emo = threading.Thread(
-                target=emotion_worker,
-                args=(label, q_emo, out_dir, max(1, args.emo_stride),
-                      max(1, args.emo_csv_flush), max(1, args.log_flush_sec),
-                      max(10, args.emo_history), PREVIEW),
-                daemon=True, name=f"proc-emo-{label}"
-            )
-            t_proc_emo.start()
-            proc_threads.append(t_proc_emo)
-
-        # Object interaction trigger lane
-        if label in process_set_obj:
-            q_obj = queue.Queue(maxsize=8)
-            queues_obj[label] = q_obj
-            trig = obj_trigs.get(label)
-            t_proc_obj = threading.Thread(
-                target=object_worker,
-                args=(label, q_obj, out_dir, max(1, args.log_flush_sec), trig),
-                kwargs=dict(preview=PREVIEW),  # ✅ forward preview for mask overlay
-                daemon=True, name=f"proc-obj-{label}"
-            )
-            t_proc_obj.start()
-            obj_threads.append(t_proc_obj)
-
-        # Capture
-        t_cap = threading.Thread(
-            target=capture_worker,
-            args=(serial, label, out_dir, float(args.duration_sec), max(0, args.save_every),
-                  (args.filters == "on"), queues_mov.get(label, None),
-                  queues_emo.get(label, None), args.backpressure,
-                  queues_obj.get(label, None)),  # ✅ NEW
-            daemon=True, name=f"cap-{label}"
-        )
-        t_cap.start()
-        cap_threads.append(t_cap)
-
-    # --- Audio ---
-    def _list_alsa_hw_devices():
-        try:
-            out = subprocess.check_output(["arecord", "-l"], stderr=subprocess.STDOUT, text=True)
-        except Exception:
-            return []
-        found = []
-        for line in out.splitlines():
-            line = line.strip()
-            if line.startswith("card "):
-                try:
-                    parts = [p.strip() for p in line.split(",")]
-                    cidx = int(parts[0].split()[1].rstrip(":"))
-                    didx = int(parts[1].split()[1].rstrip(":"))
-                    found.append(f"hw:{cidx},{didx}")
-                except Exception:
-                    continue
-        return found
-
-    audio_threads = []
-    aud_dir = Path(args.audio_out) if args.audio_out else (out_dir / "audio")
-    if args.audio_duration_sec > 0:
-        present = set(_list_alsa_hw_devices())
-        enabled = [d for d in VALID_MIC_IDS if d in present]
-        if not enabled:
-            print("[INFO] 🎙 No whitelisted mics detected; skipping audio.")
-        else:
-            for dev in enabled:
-                t = threading.Thread(
-                    target=audio_worker,
-                    args=(dev, aud_dir, float(args.audio_duration_sec), int(args.rate), preview_logger),
-                    daemon=True, name=f"aud-{dev}"
-                )
-                audio_threads.append(t)
-            for t in audio_threads:
-                t.start()
-            print(f"[INFO] 🎙 Audio enabled on {len(audio_threads)} mic(s): {', '.join(enabled)} → {aud_dir}")
-
-    # --- Wait and cleanup ---
     try:
-        for t in cap_threads:
-            t.join()
-    except Exception as e:
-        log_exception(preview_logger, "Error while joining capture threads", e)
+
+
+        args = build_argparser().parse_args()
+
+        out_dir = Path(args.output_dir).resolve()
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        # Central loggers
+        preview_logger = get_preview_logger(out_dir, flush_sec=max(1, args.log_flush_sec))
+
+        # Discover cams
+        serial_to_label = load_serial_map() 
+        ctx = rs.context()
+        connected = [dev.get_info(rs.camera_info.serial_number) for dev in ctx.query_devices()]
+        active = [(s, serial_to_label.get(s, f"cam_{s[-4:]}")) for s in connected]
+        if not active:
+            print("[ERROR] No RealSense cameras found.")
+            return
+        print(f"[INFO] Connected cams: {', '.join([f'{lab}({s})' for s,lab in active])}")
+
+        # Camera selections
+        process_set_mov = set([lab.strip() for lab in (args.process_mov_cams or []) if lab.strip()])
+        process_set_emo = set([lab.strip() for lab in (args.process_emo_cams or []) if lab.strip()])
+        process_set_obj = set([lab.strip() for lab in (args.process_obj_cams or []) if lab.strip()])
+
+        print(f"[INFO] Movement cams: {sorted(process_set_mov) if process_set_mov else 'NONE'}")
+        print(f"[INFO] Emotion cams:  {sorted(process_set_emo) if process_set_emo else 'NONE'}")
+        print(f"[INFO] Object-trigger cams: {sorted(process_set_obj) if process_set_obj else 'NONE'}")
+
+        # Speed trigger
+        if not args.no_event_checker and process_set_mov:
+            try:
+                refcsv = SPEED_TRIGGER_REFCSV_PATH
+            except NameError:
+                refcsv = "(default in trigger)"
+            print(f"[INFO] Speed-trigger checker: ENABLED (reference CSV: {refcsv})")
+        else:
+            print("[INFO] Speed-trigger checker: DISABLED")
+
+        # Object trigger setup
+        obj_trigs = {}
+        if not args.no_object_trigger:
+            if process_set_obj:
+                try:
+                    for lab in sorted(process_set_obj):
+                        cam_dir = out_dir / lab
+                        obj_log = get_object_trigger_logger(cam_dir, flush_sec=max(1, args.log_flush_sec))
+                        cam_dir = out_dir / lab
+                        trig = ObjectUntouchedTrigger(cam_dir, cam_label=lab, logger=obj_log)
+                        setattr(trig, "target_cam_labels", [lab])
+                        obj_trigs[lab] = trig
+                    print(f"[INFO] Object-trigger checker: ENABLED for {len(obj_trigs)} cam(s): {', '.join(obj_trigs.keys())}")
+                except Exception as e:
+                    print(f"[WARN] Object-trigger init failed: {e}")
+            else:
+                print("[INFO] Object-trigger checker: ENABLED but no object cams selected")
+        else:
+            print("[INFO] Object-trigger checker: DISABLED")
+
+        # Unified preview
+        PREVIEW = None
+        if args.viz_live == "on":
+            PREVIEW = PreviewGrid(
+                title="Unified Preview",
+                history_len=max(240, args.emo_history),
+                target_fps=30,
+                logger=preview_logger,
+            )
+            PREVIEW.start()
+            # ✅ ensure the X-axis lock in the cumulative plot matches runtime duration exactly
+            try:
+                PREVIEW.set_total_duration(float(args.duration_sec))
+            except Exception:
+                pass
+
+        _kbd = start_keyboard_listener(PREVIEW)
+
+        # Queues & threads
+        cap_threads, proc_threads = [], []
+        queues_mov: Dict[str, queue.Queue] = {}
+        queues_emo: Dict[str, queue.Queue] = {}
+        queues_obj: Dict[str, queue.Queue] = {}  # ✅ NEW
+        obj_threads = []  # ✅ NEW
+
+        for serial, label in active:
+            q_mov = None
+            q_emo = None
+            q_obj = None  # ✅ NEW
+
+            # Movement
+            if label in process_set_mov:
+                q_mov = queue.Queue(maxsize=8)
+                queues_mov[label] = q_mov
+                t_proc_mov = threading.Thread(
+                    target=processor_worker,
+                    args=(label, q_mov, out_dir, args.force_flip, max(1, args.stride),
+                        max(1, args.csv_flush), max(1, args.log_flush_sec),
+                        PREVIEW, max(0, args.viz_save_every)),
+                    kwargs=dict(event_checker_enabled=(not args.no_event_checker)),
+                    daemon=True, name=f"proc-mov-{label}"
+                )
+                t_proc_mov.start()
+                proc_threads.append(t_proc_mov)
+
+            # Emotion
+            if label in process_set_emo:
+                q_emo = queue.Queue(maxsize=8)
+                queues_emo[label] = q_emo
+                t_proc_emo = threading.Thread(
+                    target=emotion_worker,
+                    args=(label, q_emo, out_dir, max(1, args.emo_stride),
+                        max(1, args.emo_csv_flush), max(1, args.log_flush_sec),
+                        max(10, args.emo_history), PREVIEW),
+                    daemon=True, name=f"proc-emo-{label}"
+                )
+                t_proc_emo.start()
+                proc_threads.append(t_proc_emo)
+
+            # Object interaction trigger lane
+            if label in process_set_obj:
+                q_obj = queue.Queue(maxsize=8)
+                queues_obj[label] = q_obj
+                trig = obj_trigs.get(label)
+                t_proc_obj = threading.Thread(
+                    target=object_worker,
+                    args=(label, q_obj, out_dir, max(1, args.log_flush_sec), trig),
+                    kwargs=dict(preview=PREVIEW),  # ✅ forward preview for mask overlay
+                    daemon=True, name=f"proc-obj-{label}"
+                )
+                t_proc_obj.start()
+                obj_threads.append(t_proc_obj)
+
+            # Capture
+            t_cap = threading.Thread(
+                target=capture_worker,
+                args=(serial, label, out_dir, float(args.duration_sec), max(0, args.save_every),
+                    (args.filters == "on"), queues_mov.get(label, None),
+                    queues_emo.get(label, None), args.backpressure,
+                    queues_obj.get(label, None)),  # ✅ NEW
+                daemon=True, name=f"cap-{label}"
+            )
+            t_cap.start()
+            cap_threads.append(t_cap)
+
+        # --- Audio ---
+        def _list_alsa_hw_devices():
+            try:
+                out = subprocess.check_output(["arecord", "-l"], stderr=subprocess.STDOUT, text=True)
+            except Exception:
+                return []
+            found = []
+            for line in out.splitlines():
+                line = line.strip()
+                if line.startswith("card "):
+                    try:
+                        parts = [p.strip() for p in line.split(",")]
+                        cidx = int(parts[0].split()[1].rstrip(":"))
+                        didx = int(parts[1].split()[1].rstrip(":"))
+                        found.append(f"hw:{cidx},{didx}")
+                    except Exception:
+                        continue
+            return found
+
+        audio_threads = []
+        aud_dir = Path(args.audio_out) if args.audio_out else (out_dir / "audio")
+        if args.audio_duration_sec > 0:
+            present = set(_list_alsa_hw_devices())
+            enabled = [d for d in VALID_MIC_IDS if d in present]
+            if not enabled:
+                print("[INFO] 🎙 No whitelisted mics detected; skipping audio.")
+            else:
+                for dev in enabled:
+                    t = threading.Thread(
+                        target=audio_worker,
+                        args=(dev, aud_dir, float(args.audio_duration_sec), int(args.rate), preview_logger),
+                        daemon=True, name=f"aud-{dev}"
+                    )
+                    audio_threads.append(t)
+                for t in audio_threads:
+                    t.start()
+                print(f"[INFO] 🎙 Audio enabled on {len(audio_threads)} mic(s): {', '.join(enabled)} → {aud_dir}")
+
+        # --- Wait and cleanup ---
+        try:
+            for t in cap_threads:
+                t.join()
+        except Exception as e:
+            log_exception(preview_logger, "Error while joining capture threads", e)
+        finally:
+            for q in list(queues_mov.values()) + list(queues_emo.values()) + list(queues_obj.values()):
+                setattr(q, "closed", True)
+
+            for t in proc_threads + obj_threads:
+                try:
+                    t.join()
+                except Exception as e:
+                    log_exception(preview_logger, "Error while joining processor threads", e)
+
+            for t in audio_threads:
+                try:
+                    t.join()
+                except Exception as e:
+                    log_exception(preview_logger, "Error while joining audio threads", e)
+
+            if PREVIEW is not None:
+                PREVIEW.stop()
+
+            try:
+                import cv2
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
+
+        # --- Force log flush ---
+        preview_logger.periodic_flush(force=True)
+        for _lab, _trig in obj_trigs.items():
+            try:
+                _trig.logger.periodic_flush(force=True)
+            except Exception:
+                pass
+        print("[🏁] Done.")
+
+    except KeyboardInterrupt:
+        print("\n[⛔] KeyboardInterrupt → stopping…", flush=True)
+
     finally:
-        for q in list(queues_mov.values()) + list(queues_emo.values()) + list(queues_obj.values()):
-            setattr(q, "closed", True)
-
-        for t in proc_threads + obj_threads:
-            try:
-                t.join()
-            except Exception as e:
-                log_exception(preview_logger, "Error while joining processor threads", e)
-
-        for t in audio_threads:
-            try:
-                t.join()
-            except Exception as e:
-                log_exception(preview_logger, "Error while joining audio threads", e)
-
-        if PREVIEW is not None:
-            PREVIEW.stop()
-
+        # --- Shutdown ROS2 node gracefully ---
+        print("[🧹] Shutting down ROS2...")
+        ROS2PublisherNode.shutdown()
         try:
-            import cv2
-            cv2.destroyAllWindows()
+            spin_thread.join(timeout=1.0)
         except Exception:
             pass
-
-    # --- Force log flush ---
-    preview_logger.periodic_flush(force=True)
-    for _lab, _trig in obj_trigs.items():
-        try:
-            _trig.logger.periodic_flush(force=True)
-        except Exception:
-            pass
-    print("[🏁] Done.")
+        print("[✅] ROS2 shutdown complete.")
 
 
 if __name__ == "__main__":

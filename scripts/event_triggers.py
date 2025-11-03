@@ -13,6 +13,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
+import random
+
+from ros_publisher_node import ROS2PublisherNode 
+
 
 from tunables import (
     SPEED_TRIGGER_CADENCE_WINDOW_S,
@@ -164,6 +168,9 @@ class RightWristSpeedTrigger(BaseTrigger):
                                  "Low Speed" if reason == "low" else "High Speed",
                                  kind="speed")
 
+        node = ROS2PublisherNode.get_instance()
+        node.handspeed_piece_data = reason
+
         return {"good": good, "reason": reason, "value": cur_avg_speed,
                 "lower": lo, "upper": hi, "slot": slot, "elapsed_s": elapsed_time_s}
 
@@ -240,7 +247,7 @@ class ObjectUntouchedTrigger(BaseTrigger):
             # not enough history yet → do not log
             # build a minimal return payload and exit
             return {
-                "good": False,
+                # "good": False,
                 "qualified_count": 0,
                 "per_object_sec": {},
                 "per_object_pct": {},
@@ -260,6 +267,7 @@ class ObjectUntouchedTrigger(BaseTrigger):
         per_obj_pct: Dict[str, float] = {}
         per_obj_state: Dict[str, str] = {}
         count_qualified = 0
+        untouched_objects = []
 
         for obj, spans in untouched_out.items():
             total_f = 0
@@ -267,6 +275,7 @@ class ObjectUntouchedTrigger(BaseTrigger):
                 total_f += self._overlap_len(s, e, start_incl, end_incl)
             if total_f >= thresh_f:
                 count_qualified += 1
+                untouched_objects.append(obj)
 
             # metrics for return payload (seconds & percentage of W)
             sec = total_f / efps
@@ -275,26 +284,40 @@ class ObjectUntouchedTrigger(BaseTrigger):
             per_obj_state[obj] = "untouched" if self._contains_frame(spans, end_incl) else "other"
 
         # Decide label
-        if count_qualified < 2:
-            label = "Bad:Less"
-            good_flag = False
-        elif count_qualified >= 4:
-            label = "Bad:More"
-            good_flag = False
-        else:
-            label = "Good"
-            good_flag = True
+        # if count_qualified < 2:
+        #     label = "less"
+        #     good_flag = False
+        # elif count_qualified >= 4:
+        #     label = "more"
+        #     good_flag = False
+        # else:
+        #     label = "good"
+        #     good_flag = True
+
+        object_list = {"red":True, "green":True, "gray":True, "yellow_1":True, "yellow_2":True, "gold":True}
+        object_list_ros = {"red":True, "green":True, "grey":True, "yellow":True, "small yellow":True, "brown":True}
+        for obj in object_list.keys():
+            if obj not in untouched_objects:
+                object_list[obj] = False
+
+        for obj in object_list_ros.keys():
+            if obj not in untouched_objects:
+                object_list_ros[obj] = False
 
         # --- Log exactly one simple line per frame (no extras) ---
-        line = f"[{start_incl}: {end_excl}] = {label}"
+        line = f"[{start_incl}: {end_excl}] = {object_list}"
         try:
             self.logger.info(line); self.logger.periodic_flush()
         except Exception:
             pass
+        
+        label1 = str(object_list_ros)   # "{object} : {True|False}"
+        node = ROS2PublisherNode.get_instance()
+        node.untouched_piece_data = label1
 
         # Return payload (kept for compatibility)
         return {
-            "good": good_flag,
+            # "good": good_flag,
             "qualified_count": count_qualified,
             "per_object_sec": per_obj_sec,
             "per_object_pct": per_obj_pct,
