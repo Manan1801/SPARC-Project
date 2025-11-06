@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
 import random
+import json
 
 from ros_publisher_node import ROS2PublisherNode 
 
@@ -311,7 +312,7 @@ class ObjectUntouchedTrigger(BaseTrigger):
         except Exception:
             pass
         
-        label1 = str(object_list_ros)   # "{object} : {True|False}"
+        label1 = json.dumps(object_list_ros)   # "{object} : {True|False}"
         node = ROS2PublisherNode.get_instance()
         node.untouched_piece_data = label1
 
