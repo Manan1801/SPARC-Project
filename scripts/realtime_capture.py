@@ -259,11 +259,21 @@ def main():
                 queues_mov[label] = q_mov
                 t_proc_mov = threading.Thread(
                     target=processor_worker,
-                    args=(label, q_mov, out_dir, args.force_flip, max(1, args.stride),
-                        max(1, args.csv_flush), max(1, args.log_flush_sec),
-                        PREVIEW, max(0, args.viz_save_every)),
+                    args=(
+                        label,
+                        q_mov,
+                        out_dir,
+                        args.force_flip,
+                        max(1, args.stride),
+                        max(1, args.csv_flush),
+                        max(1, args.log_flush_sec),
+                        PREVIEW,
+                        max(0, args.viz_save_every),
+                        float(args.duration_sec),  # 👈 NEW: total task duration (T_total)
+                    ),
                     kwargs=dict(event_checker_enabled=(not args.no_event_checker)),
-                    daemon=True, name=f"proc-mov-{label}"
+                    daemon=True,
+                    name=f"proc-mov-{label}",
                 )
                 t_proc_mov.start()
                 proc_threads.append(t_proc_mov)

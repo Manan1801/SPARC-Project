@@ -142,6 +142,7 @@ def processor_worker(
     log_flush_sec: int,
     preview: Optional[PreviewGrid],
     viz_save_every: int = 0,
+    total_duration_sec: float = 0.0,   # 👈 NEW: T_total passed from realtime_capture
     *,
     event_checker_enabled: bool = True,
 ):
@@ -177,9 +178,11 @@ def processor_worker(
     plot_tick = 0
 
     # NEW: instantiate centralized right-wrist speed trigger (logs to cam_dir/logs)
+    # Pass total_duration_sec so it can build the 3 equal time segments.
     speed_trigger = RightWristSpeedTrigger(
         movement_cam_dir=cam_dir,
         cam_label=cam_label,
+        total_duration_s=float(total_duration_sec) if total_duration_sec > 0 else None,
     )
 
     try:

@@ -60,5 +60,5 @@ OBJ_DEPTH_UNITS       = 0.0010000000474974513
 OBJ_COLORS = ["red", "green", "gray", "yellow", "gold"]  # ✅ changed from explicit _1/_2
 
 # ─── Object trigger thresholds ──────────────────────────────
-OBJECT_TRIGGER_WINDOW_SEC = 180.0
+OBJECT_TRIGGER_WINDOW_SEC = 120.0
 OBJECT_TRIGGER_MIN_PCT = 90.0

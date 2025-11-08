@@ -3,7 +3,7 @@
 event_triggers.py
 
 Central place for trigger checks, flagging, and logging while capture/processing runs.
-(Existing RightWristSpeedTrigger kept; ObjectUntouchedTrigger updated per spec.)
+(RightWristSpeedTrigger uses 3 segment-local averages; ObjectUntouchedTrigger updated per spec.)
 """
 
 from __future__ import annotations
@@ -16,8 +16,7 @@ from typing import Optional, Tuple, List, Dict
 import random
 import json
 
-from ros_publisher_node import ROS2PublisherNode 
-
+from ros_publisher_node import ROS2PublisherNode
 
 from tunables import (
     SPEED_TRIGGER_CADENCE_WINDOW_S,
@@ -36,6 +35,7 @@ from logger_utils import (
 
 def _iso_now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S")
+
 
 # (speed trigger still uses preview overlays via annotate_event)
 def _notify_preview_grid(preview_grid, cam_label: str, text: str, kind: str = "speed",
@@ -100,16 +100,47 @@ class BaseTrigger:
         pass
 
 
-# ---------------------- Right Wrist Speed Trigger (unchanged) -------------------
+# ---------------------- Right Wrist Speed Trigger (UPDATED) -------------------
 
 class RightWristSpeedTrigger(BaseTrigger):
+    """
+    Right wrist speed trigger with 3 equal time segments over the total task duration.
+
+    - total_duration_s (seconds) is optionally passed at construction.
+    - T_total is divided into 3 equal segments:
+        [0, T_total/3), [T_total/3, 2*T_total/3), [2*T_total/3, T_total]
+      Anything beyond T_total is treated as segment 2.
+    - For each segment, we compute a *segment-local* average speed:
+
+          segment_movement = cumulative_movement - segment_base_movement
+          segment_elapsed  = elapsed_time_s - segment_start_time_s
+          avg_speed        = segment_movement / segment_elapsed
+
+      where segment_base_movement and segment_start_time_s are reset when we
+      enter a new segment. This ensures movement is not carried forward from any
+      previous segment into the next one.
+
+    - The reference CSV lookup still uses the *global* elapsed time:
+
+          lo, hi = ref.get_bounds(elapsed_time_s)
+
+      so we compare the segment-local average speed against bounds defined as a
+      function of global elapsed time.
+
+    - Additionally, we compute a global average speed:
+          global_avg_speed = cumulative_movement / elapsed_time_s
+
+      and log both speeds.
+    """
+
     def __init__(self,
                  movement_cam_dir: Path,
                  cam_label: str,
                  reference_csv: Optional[Path] = None,
                  cadence_window_s: float = SPEED_TRIGGER_CADENCE_WINDOW_S,
                  overlay_ttl_s: float = SPEED_TRIGGER_OVERLAY_TTL_S,
-                 logger: Optional[DebouncedLogger] = None):
+                 logger: Optional[DebouncedLogger] = None,
+                 total_duration_s: Optional[float] = None):
         super().__init__("right_wrist_speed")
         self.cam_label = cam_label
         self.cadence_window_s = max(0.1, float(cadence_window_s))
@@ -122,11 +153,46 @@ class RightWristSpeedTrigger(BaseTrigger):
         self.logger: DebouncedLogger = logger if logger is not None else get_speed_trigger_logger(self.movement_cam_dir)
         self._last_bad_slot_logged: Optional[int] = None
 
+        # 3-segment support
+        self.total_duration_s: Optional[float] = (
+            float(total_duration_s) if total_duration_s is not None and total_duration_s > 0 else None
+        )
+        self.segment_len_s: Optional[float] = (
+            self.total_duration_s / 3.0 if self.total_duration_s is not None else None
+        )
+
+        # segment-local state
+        self._cur_segment_index: Optional[int] = None
+        self._segment_start_time_s: float = 0.0
+        self._segment_base_movement: float = 0.0
+
     def reset(self):
         self._last_bad_slot_logged = None
+        # reset segment state as well
+        self._cur_segment_index = None
+        self._segment_start_time_s = 0.0
+        self._segment_base_movement = 0.0
 
     def _slot_index(self, elapsed_s: float) -> int:
         return int(math.floor(elapsed_s / self.cadence_window_s))
+
+    def _segment_index(self, elapsed_s: float) -> int:
+        """
+        Map global elapsed_s to segment index:
+          0 -> [0, T/3)
+          1 -> [T/3, 2T/3)
+          2 -> [2T/3, T] and anything beyond T
+        """
+        if self.segment_len_s is None or elapsed_s < 0.0:
+            return 0  # fall back to segment 0 if no total_duration_s
+        if self.total_duration_s is not None and elapsed_s >= self.total_duration_s:
+            return 2
+        idx = int(elapsed_s // self.segment_len_s)
+        if idx < 0:
+            idx = 0
+        if idx > 2:
+            idx = 2
+        return idx
 
     def _judge(self, value: float, lo: float, hi: float) -> Tuple[bool, str]:
         if value < lo:
@@ -136,9 +202,19 @@ class RightWristSpeedTrigger(BaseTrigger):
         return True, "good"
 
     def _format_line(self, *, ts_s: float, frame_idx: int, slot: int,
-                     status: str, value: float, lo: float, hi: float) -> str:
-        return (f"{_iso_now()} ts={ts_s:.3f} frame={frame_idx} slot={slot} "
-                f"status={status.upper()} value={value:.6f} lo={lo:.6f} hi={hi:.6f} cam={self.cam_label}")
+                     status: str,
+                     seg_value: float,
+                     global_value: float,
+                     lo: float, hi: float,
+                     segment_index: int,
+                     segment_elapsed: float) -> str:
+        return (
+            f"{_iso_now()} ts={ts_s:.3f} frame={frame_idx} slot={slot} "
+            f"seg={segment_index} seg_elapsed={segment_elapsed:.3f} "
+            f"status={status.upper()} seg_speed={seg_value:.6f} "
+            f"global_speed={global_value:.6f} lo={lo:.6f} hi={hi:.6f} "
+            f"cam={self.cam_label}"
+        )
 
     def update(self,
                *,
@@ -147,33 +223,98 @@ class RightWristSpeedTrigger(BaseTrigger):
                cumulative_movement: float,
                preview_grid=None) -> dict:
         if elapsed_time_s <= 0:
-            return {"good": True, "reason": "good", "value": 0.0,
-                    "lower": float("nan"), "upper": float("nan"),
-                    "slot": self._slot_index(0.0), "elapsed_s": 0.0}
+            return {
+                "good": True,
+                "reason": "good",
+                "value": 0.0,              # segment-local (degenerate)
+                "global_value": 0.0,
+                "lower": float("nan"),
+                "upper": float("nan"),
+                "slot": self._slot_index(0.0),
+                "elapsed_s": 0.0,
+                "segment_index": 0,
+                "segment_elapsed_s": 0.0,
+                "segment_movement": 0.0,
+            }
 
-        cur_avg_speed = float(cumulative_movement) / float(elapsed_time_s)
+        # Global average speed (always defined if elapsed_time_s > 0)
+        global_avg_speed = float(cumulative_movement) / float(elapsed_time_s)
+
+        # --- segment-local averaging ---
+        if self.segment_len_s is not None:
+            seg_idx = self._segment_index(elapsed_time_s)
+
+            # first time we are called, or segment change
+            if self._cur_segment_index is None or seg_idx != self._cur_segment_index:
+                self._cur_segment_index = seg_idx
+                self._segment_start_time_s = float(elapsed_time_s)
+                self._segment_base_movement = float(cumulative_movement)
+
+            segment_elapsed = float(elapsed_time_s - self._segment_start_time_s)
+            if segment_elapsed <= 0.0:
+                segment_elapsed = 0.0
+                segment_movement = 0.0
+                seg_avg_speed = 0.0
+            else:
+                segment_movement = float(cumulative_movement - self._segment_base_movement)
+                seg_avg_speed = segment_movement / segment_elapsed
+        else:
+            # Fallback: original global-average behavior if no total_duration_s
+            seg_idx = 0
+            segment_elapsed = float(elapsed_time_s)
+            segment_movement = float(cumulative_movement)
+            seg_avg_speed = (
+                segment_movement / segment_elapsed if segment_elapsed > 0.0 else 0.0
+            )
+
+        # Reference CSV lookup still uses *global* elapsed_time_s
         lo, hi = self.ref.get_bounds(elapsed_time_s)
-        good, reason = self._judge(cur_avg_speed, lo, hi)
+        # Judge based on *segment-local* speed
+        good, reason = self._judge(seg_avg_speed, lo, hi)
         slot = self._slot_index(elapsed_time_s)
 
         if not good and self._last_bad_slot_logged != slot:
-            line = self._format_line(ts_s=elapsed_time_s, frame_idx=frame_idx, slot=slot,
-                                     status=("LOW" if reason == "low" else "HIGH"),
-                                     value=cur_avg_speed, lo=lo, hi=hi)
+            line = self._format_line(
+                ts_s=elapsed_time_s,
+                frame_idx=frame_idx,
+                slot=slot,
+                status=("LOW" if reason == "low" else "HIGH"),
+                seg_value=seg_avg_speed,
+                global_value=global_avg_speed,
+                lo=lo,
+                hi=hi,
+                segment_index=seg_idx,
+                segment_elapsed=segment_elapsed,
+            )
             try:
-                self.logger.info(line); self.logger.periodic_flush()
+                self.logger.info(line)
+                self.logger.periodic_flush()
             except Exception:
                 pass
             self._last_bad_slot_logged = slot
-            _notify_preview_grid(preview_grid, self.cam_label,
-                                 "Low Speed" if reason == "low" else "High Speed",
-                                 kind="speed")
+            _notify_preview_grid(
+                preview_grid,
+                self.cam_label,
+                "Low Speed" if reason == "low" else "High Speed",
+                kind="speed",
+            )
 
         node = ROS2PublisherNode.get_instance()
         node.handspeed_piece_data = reason
 
-        return {"good": good, "reason": reason, "value": cur_avg_speed,
-                "lower": lo, "upper": hi, "slot": slot, "elapsed_s": elapsed_time_s}
+        return {
+            "good": good,
+            "reason": reason,
+            "value": seg_avg_speed,          # segment-local speed
+            "global_value": global_avg_speed,
+            "lower": lo,
+            "upper": hi,
+            "slot": slot,
+            "elapsed_s": elapsed_time_s,
+            "segment_index": seg_idx,
+            "segment_elapsed_s": segment_elapsed,
+            "segment_movement": segment_movement,
+        }
 
 
 # ---------------------- Object Untouched Trigger (UPDATED) -------------------
@@ -248,7 +389,6 @@ class ObjectUntouchedTrigger(BaseTrigger):
             # not enough history yet → do not log
             # build a minimal return payload and exit
             return {
-                # "good": False,
                 "qualified_count": 0,
                 "per_object_sec": {},
                 "per_object_pct": {},
@@ -284,19 +424,8 @@ class ObjectUntouchedTrigger(BaseTrigger):
             per_obj_pct[obj] = (sec / self.W) * 100.0 if self.W > 0 else 0.0
             per_obj_state[obj] = "untouched" if self._contains_frame(spans, end_incl) else "other"
 
-        # Decide label
-        # if count_qualified < 2:
-        #     label = "less"
-        #     good_flag = False
-        # elif count_qualified >= 4:
-        #     label = "more"
-        #     good_flag = False
-        # else:
-        #     label = "good"
-        #     good_flag = True
-
-        object_list = {"red":True, "green":True, "gray":True, "yellow_1":True, "yellow_2":True, "gold":True}
-        object_list_ros = {"red":True, "green":True, "grey":True, "yellow":True, "small yellow":True, "brown":True}
+        object_list = {"red": True, "green": True, "gray": True, "yellow_1": True, "yellow_2": True, "gold": True}
+        object_list_ros = {"red": True, "green": True, "grey": True, "yellow": True, "small yellow": True, "brown": True}
         for obj in object_list.keys():
             if obj not in untouched_objects:
                 object_list[obj] = False
@@ -308,17 +437,17 @@ class ObjectUntouchedTrigger(BaseTrigger):
         # --- Log exactly one simple line per frame (no extras) ---
         line = f"[{start_incl}: {end_excl}] = {object_list}"
         try:
-            self.logger.info(line); self.logger.periodic_flush()
+            self.logger.info(line)
+            self.logger.periodic_flush()
         except Exception:
             pass
-        
+
         label1 = json.dumps(object_list_ros)   # "{object} : {True|False}"
         node = ROS2PublisherNode.get_instance()
         node.untouched_piece_data = label1
 
         # Return payload (kept for compatibility)
         return {
-            # "good": good_flag,
             "qualified_count": count_qualified,
             "per_object_sec": per_obj_sec,
             "per_object_pct": per_obj_pct,
