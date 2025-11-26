@@ -34,7 +34,7 @@ DEFAULT_CELL_H = 360
 
 # ---------- Audio device whitelist ----------
 VALID_MIC_IDS = [
-    'hw:2,0',
+    'hw:2,0',   # card index, device index
     'hw:3,0',
 ]
 
