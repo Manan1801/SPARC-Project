@@ -131,28 +131,55 @@ _PLACER = _LanePlacer()
 
 def _add_slope_annotation(fig, x_seg, a, b, y_context, label=None):
     """
-    Large, readable slope label in Times New Roman, with lane-based staggering
-    in both x and y (pixel space) to avoid overlaps across classes/segments.
+    Place slope label without overlap:
+
+    • Non-Learners  -> always treated as the UPPER line
+                       → only bottom-right corner of box touches the line.
+    • Learners      -> always treated as the LOWER line
+                       → only top-left corner of box touches the line.
     """
+
     x0, x1 = float(x_seg[0]), float(x_seg[-1])
     xm = 0.5 * (x0 + x1)
     ym = a * xm + b
 
-    # get pixel-space shifts for this x bucket
-    _, xshift, yshift = _PLACER.assign(xm)
+    label = label or ""
+
+    if "Nlrn" in label:
+        # Upper line (Non-Learners): bottom-right corner on the line
+        # box extends up and left from (xm, ym)
+        xanchor = "right"
+        yanchor = "bottom"
+        xshift = -10
+        yshift = -10
+    elif "Lrn" in label:
+        # Lower line (Learners): top-left corner on the line
+        # box extends down and right from (xm, ym)
+        xanchor = "left"
+        yanchor = "top"
+        xshift = 10
+        yshift = 10
+    else:
+        # Fallback (if something else ever appears)
+        xanchor = "center"
+        yanchor = "middle"
+        xshift = 0
+        yshift = 0
 
     fig.add_annotation(
-        x=xm, y=ym,
+        x=xm,
+        y=ym,
         text=f"m={a:.3f} mm/s",
         showarrow=False,
         bgcolor="rgba(255,255,255,0.95)",
         bordercolor="gray",
         borderwidth=1,
-        font=dict(size=18, family="Times New Roman", color="black"),
+        font=dict(size=24, family="Times New Roman", color="black"),  # bigger slope text
         align="center",
+        xanchor=xanchor,
+        yanchor=yanchor,
         xshift=xshift,
         yshift=yshift,
-        yanchor="middle"
     )
 
 
@@ -174,7 +201,7 @@ def add_piecewise_fixed(fig, x_vals, y_vals, label, win_chunks, color):
                            "Fit value: %{{y:.2f}} mm<br>"
                            f"Slope: {a:.3f} mm/s<br>R²: {r2:.3f}")
         ))
-        _add_slope_annotation(fig, x_vals[start:end], a, b, y_vals)
+        _add_slope_annotation(fig, x_vals[start:end], a, b, y_vals, label)
     return segcount
 
 def add_piecewise_auto(fig, x_vals, y_vals, label, color, maxsegs=8, penalty=None, minseg=3):
@@ -318,24 +345,39 @@ def main():
 
     title_bits = ["Learners vs. Non-Learners"]
     fig.update_layout(
-        font=dict(size=16, family="Times New Roman", color="black"),
+        font=dict(size=20, family="Times New Roman", color="black"),  # base font size
+        title=dict(
+            text=" — ".join(title_bits),
+            font=dict(size=28)    # plot title
+        ),
+        xaxis=dict(
+            title=dict(text="Time (seconds)", font=dict(size=24)),
+            tickfont=dict(size=20)
+        ),
+        yaxis=dict(
+            title=dict(text="Cumulative Movement (mm)", font=dict(size=24)),
+            tickfont=dict(size=20),
+            nticks=6,              # FEWER y-gridlines (default ~10 → now 6)
+            gridcolor="rgba(0,0,0,0.1)",
+            gridwidth=0.5,
+        ),
         width=1000,
         height=800,
-        title=" — ".join(title_bits),
-        xaxis_title="Time (seconds)",
-        yaxis_title="Cumulative Movement (mm)",
         hovermode="x unified",
         template="plotly_white",
         legend=dict(
             title="Series",
-            x=0.75, y=0.99,
-            xanchor='right',
+            font=dict(size=20),
+            title_font=dict(size=22),
+            x=0.1, y=0.99,
+            xanchor='left',
             yanchor='top',
             bgcolor='rgba(255,255,255,0.8)',
             bordercolor='lightgray',
             borderwidth=1
         )
     )
+
 
     if args.save:
         out_path = args.save
