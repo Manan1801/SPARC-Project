@@ -174,7 +174,7 @@ def _add_slope_annotation(fig, x_seg, a, b, y_context, label=None):
         bgcolor="rgba(255,255,255,0.95)",
         bordercolor="gray",
         borderwidth=1,
-        font=dict(size=24, family="Times New Roman", color="black"),  # bigger slope text
+        font=dict(size=28, family="Times New Roman", color="black"),  # bigger slope text
         align="center",
         xanchor=xanchor,
         yanchor=yanchor,
@@ -348,15 +348,15 @@ def main():
         font=dict(size=20, family="Times New Roman", color="black"),  # base font size
         title=dict(
             text=" — ".join(title_bits),
-            font=dict(size=28)    # plot title
+            font=dict(size=32)    # plot title
         ),
         xaxis=dict(
             title=dict(text="Time (seconds)", font=dict(size=24)),
-            tickfont=dict(size=20)
+            tickfont=dict(size=22)
         ),
         yaxis=dict(
             title=dict(text="Cumulative Movement (mm)", font=dict(size=24)),
-            tickfont=dict(size=20),
+            tickfont=dict(size=22),
             nticks=6,              # FEWER y-gridlines (default ~10 → now 6)
             gridcolor="rgba(0,0,0,0.1)",
             gridwidth=0.5,
@@ -367,8 +367,8 @@ def main():
         template="plotly_white",
         legend=dict(
             title="Series",
-            font=dict(size=20),
-            title_font=dict(size=22),
+            font=dict(size=24),
+            title_font=dict(size=26),
             x=0.1, y=0.99,
             xanchor='left',
             yanchor='top',
