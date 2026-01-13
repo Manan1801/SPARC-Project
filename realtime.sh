@@ -72,6 +72,9 @@ SAVE_EVERY="$(ask "Save raw frames? Enter N (0 = OFF)" "1")"
 VIZ_LIVE="$(ask "Live preview window? (off/on)" "on")"
 
 echo
+NOTES_ENABLE="$(ask_yn "Enable Notes UI (chat panel)?" "y")"   # ← NEW
+
+echo
 echo "Which camera(s) to PROCESS for MOVEMENT?"
 echo "  - Comma-separated labels (e.g., cam2 or cam1,cam3)"
 echo "  - Enter 'all' to process all"
@@ -153,6 +156,13 @@ CMD+=("--stride" "$STRIDE" "--backpressure" "$BKP_POLICY" "--viz-save-every" "$V
 CMD+=("--csv-flush" "$CSV_FLUSH" "--log-flush-sec" "$LOG_FLUSH_SEC")
 CMD+=("--emo-history" "$EMO_HISTORY" "--emo-stride" "$EMO_STRIDE" "--emo-csv-flush" "$EMO_CSV_FLUSH")
 
+# Notes toggle  ← NEW
+if [[ "${NOTES_ENABLE,,}" == "y" ]]; then
+  CMD+=("--notes" "on")
+else
+  CMD+=("--notes" "off")
+fi
+
 # Movement cams
 IFS=',' read -r -a MOV_ARR <<<"${PROC_MOV_INPUT// /}"
 if [[ "${PROC_MOV_INPUT,,}" != "none" && "${PROC_MOV_INPUT,,}" != "all" ]]; then
@@ -195,6 +205,7 @@ echo "Output dir        : $OUTPUT_DIR"
 echo "Duration (sec)    : $DUR_SEC"
 echo "Save-every (raw)  : $SAVE_EVERY"
 echo "Live preview      : $VIZ_LIVE"
+echo "Notes UI          : $([[ "${NOTES_ENABLE,,}" == "y" ]] && echo "ENABLED" || echo "DISABLED")"
 echo "Movement cams     : $PROC_MOV_INPUT"
 echo "Emotion cams      : $PROC_EMO_INPUT"
 echo "Object cams       : $PROC_OBJ_INPUT"

@@ -141,6 +141,10 @@ def build_argparser():
     ap.add_argument("--viz-save-every", type=int, default=3,
                     help="Save annotated movement preview every N frames (0 = OFF)")
 
+    # notes UI
+    ap.add_argument("--notes", choices=["off","on"], default="on",
+                    help="Notes UI (chat messenger panel) on/off")
+
     # event checker toggles
     ap.add_argument("--no-event-checker", action="store_true",
                     help="Disable the R0 expected-speed event checker (default: enabled)")
@@ -175,7 +179,7 @@ def main():
         preview_logger = get_preview_logger(out_dir, flush_sec=max(1, args.log_flush_sec))
 
         # Discover cams
-        serial_to_label = load_serial_map() 
+        serial_to_label = load_serial_map()
         ctx = rs.context()
         connected = [dev.get_info(rs.camera_info.serial_number) for dev in ctx.query_devices()]
         active = [(s, serial_to_label.get(s, f"cam_{s[-4:]}")) for s in connected]
@@ -231,6 +235,9 @@ def main():
                 history_len=max(240, args.emo_history),
                 target_fps=30,
                 logger=preview_logger,
+                enable_event_overlay=(not args.no_event_checker),
+                enable_object_overlay=(not args.no_object_trigger),
+                show_cv2_window=(args.notes != "on"),   # ✅ IMPORTANT
             )
             PREVIEW.start()
             # ✅ ensure the X-axis lock in the cumulative plot matches runtime duration exactly
@@ -238,6 +245,19 @@ def main():
                 PREVIEW.set_total_duration(float(args.duration_sec))
             except Exception:
                 pass
+
+        # ✅ Notes UI (chat messenger panel) — runs in its own GUI loop (typing does not affect terminal keys)
+        NOTES_APP = None
+        NOTES_WIN = None
+
+        if (args.notes == "on") and (PREVIEW is not None):
+            try:
+                from notes_ui import start_notes_ui
+                NOTES_APP, NOTES_WIN = start_notes_ui(PREVIEW, out_dir, logger=preview_logger)
+                preview_logger.info("Notes UI started")
+                preview_logger.periodic_flush()
+            except Exception as e:
+                print(f"[WARN] Notes UI not started: {e}", flush=True)
 
         _kbd = start_keyboard_listener(PREVIEW)
 
@@ -358,8 +378,22 @@ def main():
 
         # --- Wait and cleanup ---
         try:
-            for t in cap_threads:
-                t.join()
+            while True:
+                alive = any(t.is_alive() for t in cap_threads)
+                if not alive:
+                    break
+
+                if stop_event.is_set():
+                    break
+
+                # ✅ keep Qt responsive
+                if NOTES_APP is not None:
+                    try:
+                        NOTES_APP.processEvents()
+                    except Exception:
+                        pass
+
+                time.sleep(0.01)
         except Exception as e:
             log_exception(preview_logger, "Error while joining capture threads", e)
         finally:
@@ -377,6 +411,13 @@ def main():
                     t.join()
                 except Exception as e:
                     log_exception(preview_logger, "Error while joining audio threads", e)
+
+            # Notes UI cleanup
+            if NOTES_WIN is not None:
+                try:
+                    NOTES_WIN.close()
+                except Exception:
+                    pass
 
             if PREVIEW is not None:
                 PREVIEW.stop()
