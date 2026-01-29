@@ -74,6 +74,12 @@ _KP_COL_RE = re.compile(r'^([LR])(\d+)_p(\d+)$')
 _HAND_TOKEN_RE = re.compile(r'^[LR](\d+)$')
 _ID_TOKEN_RE = re.compile(r'^\d+$')
 
+# ---------- Regression CSV default location ----------
+# Plots are saved to --outdir (run-specific folder),
+# but the regression slopes CSV should always be written to a stable default location.
+# Default is CURRENT WORKING DIRECTORY (NOT --outdir).
+DEFAULT_SLOPES_DIR = Path(".").resolve()
+
 
 # ---------- Parse CSV structure ----------
 def parse_kp_columns(df: pd.DataFrame):
@@ -125,6 +131,24 @@ def parse_keypoint_tokens(tokens, all_kps, mapping):
     return sel
 
 
+# ---------- NEW: Expand selection into per-keypoint-per-hand series ----------
+def expand_selected_series_specs(selected_map: dict, mapping: dict):
+    """
+    Return an ordered list of (hand, k_id) that should be plotted separately.
+
+    Example:
+      --keypoints 0 4  → selected_map has L:{0,4}, R:{0,4}
+      This expands to: [('L',0), ('L',4), ('R',0), ('R',4)]
+    """
+    specs = []
+    for hand in ("L", "R"):
+        for k in sorted(selected_map.get(hand, [])):
+            # Only include if the keypoint truly exists for that hand in the CSV.
+            if k in mapping.get(hand, {}):
+                specs.append((hand, k))
+    return specs
+
+
 # ---------- Build a single aggregated series (no tail filling) ----------
 def build_series_for_rows(rows_df: pd.DataFrame,
                           mapping, selected_map: dict) -> pd.Series:
@@ -152,6 +176,45 @@ def build_series_for_rows(rows_df: pd.DataFrame,
         if not chunk_cols:
             per_chunk_vals.append(np.nan)
         else:
+            summed = rows_df[chunk_cols].sum(axis=1, skipna=True)
+            per_chunk_vals.append(summed.mean(skipna=True))
+
+    # Do NOT forward-fill the tail; keep NaNs beyond last valid
+    s = pd.Series(per_chunk_vals, index=chunks_sorted, dtype=float)
+    # Fill ONLY internal gaps to keep regression stable: ff inside [first_valid, last_valid]
+    if s.notna().any():
+        first_idx = s.first_valid_index()
+        last_idx = s.last_valid_index()
+        s.loc[first_idx:last_idx] = s.loc[first_idx:last_idx].ffill()
+    return s
+
+
+# ---------- NEW: Build a single keypoint-hand series (no tail filling) ----------
+def build_series_for_rows_single_kp(rows_df: pd.DataFrame,
+                                    mapping: dict,
+                                    chunks_sorted: list,
+                                    hand: str,
+                                    k_id: int) -> pd.Series:
+    """
+    Build one time-series for exactly ONE keypoint of ONE hand, keeping it separate.
+
+    This is the key change requested:
+      if --keypoints includes ids like "0 4", we plot L0, L4, R0, R4 as 4 lines
+      rather than summing them into one.
+    """
+    cols = mapping.get(hand, {}).get(k_id, [])
+    if not cols:
+        # Return all-NaN series aligned to chunks, so later truncation simply drops it.
+        return pd.Series([np.nan] * len(chunks_sorted), index=chunks_sorted, dtype=float)
+
+    per_chunk_vals = []
+    for chunk in chunks_sorted:
+        # For a given (hand,k), there should be exactly one column per chunk, but we keep it robust.
+        chunk_cols = [c for c in cols if int(_KP_COL_RE.match(c).group(3)) == chunk]
+        if not chunk_cols:
+            per_chunk_vals.append(np.nan)
+        else:
+            # Per-row sum (usually one column), then mean over rows_df (pid rows or class rows).
             summed = rows_df[chunk_cols].sum(axis=1, skipna=True)
             per_chunk_vals.append(summed.mean(skipna=True))
 
@@ -376,6 +439,115 @@ def plot_matplotlib_png(series_dict, segs_dict, out_png: Path, title: str,
     plt.close()
 
 
+# ---------- NEW: Append regression slopes CSV (single-PID only) ----------
+def _normalize_pid_token(s: str) -> str:
+    """
+    Normalize PID tokens so inputs like '03' and '3' match the same rows,
+    when the CSV pid values are numeric-looking strings.
+    """
+    s = str(s).strip()
+    return str(int(s)) if s.isdigit() else s
+
+
+def append_slopes_csv_single_pid_only(out_csv: Path,
+                                      pid_to_slopes: dict,
+                                      n_segments: int):
+    """
+    Append one row per PID (single-PID series only).
+
+    Output columns:
+      PID, slope_1, slope_2, ..., slope_{n_segments}
+
+    NOTE:
+      - Aggregates (class averages) are skipped by construction because they
+        do not correspond to a single PID series.
+    """
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    need_header = (not out_csv.exists()) or (out_csv.stat().st_size == 0)
+
+    header = ["PID"] + [f"slope_{i}" for i in range(1, n_segments + 1)]
+    rows = []
+    for pid_label, slopes in pid_to_slopes.items():
+        slopes = list(slopes) if slopes is not None else []
+        if len(slopes) < n_segments:
+            slopes = slopes + [np.nan] * (n_segments - len(slopes))
+        else:
+            slopes = slopes[:n_segments]
+        rows.append([pid_label] + slopes)
+
+    pd.DataFrame(rows, columns=header).to_csv(
+        out_csv,
+        mode="a",
+        header=need_header,
+        index=False
+    )
+
+
+# ---------- NEW: Append regression slopes CSV (single-PID only, per-keypoint lines) ----------
+def append_slopes_csv_single_pid_only_per_series(out_csv: Path,
+                                                 pid_to_series_slopes: dict,
+                                                 series_order: list,
+                                                 n_segments: int):
+    """
+    Append one row per PID (single-PID series only), but keep each keypoint-hand
+    line separated under its own headers.
+
+    Output columns:
+      PID,
+      <SERIES>_slope_1 ... <SERIES>_slope_{n_segments},
+      <SERIES>_slope_1 ... etc for all series in series_order
+
+    NOTE:
+      - This updates/re-writes the CSV if the schema changes between runs
+        (e.g., you plot different keypoints next time), so headers stay correct.
+    """
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    # Build the new schema for THIS run
+    cols = ["PID"]
+    for series_label in series_order:
+        cols.extend([f"{series_label}_slope_{i}" for i in range(1, n_segments + 1)])
+
+    new_rows = []
+    for pid_label, series_map in pid_to_series_slopes.items():
+        row = {"PID": pid_label}
+        for series_label in series_order:
+            slopes = series_map.get(series_label, [])
+            slopes = list(slopes) if slopes is not None else []
+            if len(slopes) < n_segments:
+                slopes = slopes + [np.nan] * (n_segments - len(slopes))
+            else:
+                slopes = slopes[:n_segments]
+            for i in range(1, n_segments + 1):
+                row[f"{series_label}_slope_{i}"] = slopes[i - 1]
+        new_rows.append(row)
+
+    df_new = pd.DataFrame(new_rows, columns=cols)
+
+    # If CSV does not exist, write it directly.
+    if (not out_csv.exists()) or (out_csv.stat().st_size == 0):
+        df_new.to_csv(out_csv, index=False)
+        return
+
+    # If CSV exists, merge schemas safely (union columns) and re-write.
+    df_old = pd.read_csv(out_csv)
+    all_cols = []
+    for c in ["PID"]:
+        if c not in all_cols:
+            all_cols.append(c)
+    for c in df_old.columns:
+        if c not in all_cols:
+            all_cols.append(c)
+    for c in df_new.columns:
+        if c not in all_cols:
+            all_cols.append(c)
+
+    df_old2 = df_old.reindex(columns=all_cols)
+    df_new2 = df_new.reindex(columns=all_cols)
+    df_out = pd.concat([df_old2, df_new2], axis=0, ignore_index=True)
+    df_out.to_csv(out_csv, index=False)
+
+
 # ---------- Main ----------
 def main():
     ap = argparse.ArgumentParser(description="Cumulative movement plot (HTML + PNG) with optional piecewise regression")
@@ -405,6 +577,13 @@ def main():
                     help="Do not truncate; plot entire available span")
     ap.set_defaults(show_regression=True, shade_band=True, truncate_at_max=True)
 
+    # NEW: slopes CSV output (append)
+    ap.add_argument(
+        "--slopes-csv",
+        default=None,
+        help="Append single-PID regression slopes to this CSV each run (default: <prefix>__regression_slopes.csv in current working directory)"
+    )
+
     args = ap.parse_args()
 
     csv_path = Path(args.csv)
@@ -413,19 +592,29 @@ def main():
     if 'pid' not in df.columns or 'class' not in df.columns:
         raise ValueError("CSV must include 'pid' and 'class' columns.")
 
+    # NEW: normalized PID column to support inputs like '03' vs '3'
+    df["_pid_norm"] = df["pid"].astype(str).map(_normalize_pid_token)
+
     # Discover structure
     all_kps, all_chunks, mapping = parse_kp_columns(df)
 
     # Resolve keypoint selection
     sel_map = parse_keypoint_tokens(args.keypoints, all_kps, mapping)
 
+    # NEW: Expand into separate per-keypoint-per-hand series specs
+    series_specs = expand_selected_series_specs(sel_map, mapping)
+    if not series_specs:
+        raise ValueError("No keypoint-hand series found for selection. Check --keypoints tokens and CSV columns.")
+
     # Filter rows based on pid/class
     filt = pd.Series(True, index=df.index)
     title_parts = []
 
     pid_list = [str(p) for p in args.pid] if args.pid else None
-    if pid_list:
-        filt &= df['pid'].astype(str).isin(pid_list)
+    pid_list_norm = [_normalize_pid_token(p) for p in pid_list] if pid_list else None
+
+    if pid_list_norm:
+        filt &= df["_pid_norm"].isin(pid_list_norm)
         title_parts.append(f"PID={','.join(pid_list)}")
     if args.klass:
         filt &= (df['class'] == args.klass)
@@ -436,11 +625,16 @@ def main():
         raise ValueError("No rows left after applying --pid/--class filters.")
 
     # Base x grid in seconds (common across chunks)
-    base_x = np.array(all_chunks, dtype=float) * 10.0
+    chunks_sorted = sorted(set(parse_kp_columns(df)[1]))
+    base_x = np.array(chunks_sorted, dtype=float) * 10.0
 
     # Build series (truncate per-series if requested)
     series_dict, segs_dict = {}, {}
     y_on_base_for_band = {}  # label -> full-length array (NaN beyond series length)
+
+    # NEW: collect slopes for single-PID series only
+    # Now stored per PID and per series-label (e.g., "L0", "R4") so CSV headers stay separated.
+    pid_to_series_slopes = {}  # pid_label -> { series_label -> [slope_1..slope_N] }
 
     def _truncate_to_valid_and_max(x_arr, y_arr):
         valid = np.isfinite(y_arr)
@@ -456,33 +650,56 @@ def main():
             y2 = y2[:imax+1]
         return x2, y2
 
-    def _add_series(label, subdf):
-        y = build_series_for_rows(subdf, mapping, sel_map).values
-        x2, y2 = _truncate_to_valid_and_max(base_x, y)
-        if len(x2) < 2:
-            return
-        series_dict[label] = (x2, y2)
-        segs_dict[label] = fit_segments(x2, y2, args.segments)
-        # stash on base grid for band
-        buf = np.full_like(base_x, np.nan, dtype=float)
-        buf[:len(y2)] = y2  # because x2 is always a prefix of base_x
-        y_on_base_for_band[label] = buf
+    def _add_series(entity_label, subdf):
+        # IMPORTANT CHANGE:
+        # Instead of summing selected keypoints into one line per entity,
+        # we generate one separate line per selected keypoint-hand series.
+        #
+        # Example:
+        #   --keypoints 0 4  → creates L0, L4, R0, R4 (4 different lines)
+        for (hand, k_id) in series_specs:
+            kp_label = f"{hand}{k_id}"
+            label = f"{entity_label}:{kp_label}"
 
-    if pid_list and not args.klass:
-        for pid in pid_list:
-            sub = filtered[filtered['pid'].astype(str) == pid]
+            s = build_series_for_rows_single_kp(subdf, mapping, chunks_sorted, hand, k_id)
+            y = s.values
+
+            x2, y2 = _truncate_to_valid_and_max(base_x, y)
+            if len(x2) < 2:
+                continue
+
+            series_dict[label] = (x2, y2)
+            segs = fit_segments(x2, y2, args.segments)
+            segs_dict[label] = segs
+
+            # stash on base grid for band
+            buf = np.full_like(base_x, np.nan, dtype=float)
+            buf[:len(y2)] = y2  # because x2 is always a prefix of base_x
+            y_on_base_for_band[label] = buf
+
+            # NEW: store only single-PID rows and skip aggregates
+            uniq_pids = subdf["pid"].astype(str).dropna().unique().tolist()
+            if len(uniq_pids) == 1:
+                pid_key = str(uniq_pids[0])
+                pid_to_series_slopes.setdefault(pid_key, {})
+                slopes = [seg.get("slope", np.nan) for seg in segs] if segs else []
+                pid_to_series_slopes[pid_key][kp_label] = slopes
+
+    if pid_list_norm and not args.klass:
+        for pid_label, pid_norm in zip(pid_list, pid_list_norm):
+            sub = filtered[filtered["_pid_norm"] == pid_norm]
             if sub.empty:
                 continue
-            _add_series(pid, sub)
+            _add_series(pid_label, sub)
 
-    elif args.klass and pid_list:
-        for pid in pid_list:
-            sub = filtered[filtered['pid'].astype(str) == pid]
+    elif args.klass and pid_list_norm:
+        for pid_label, pid_norm in zip(pid_list, pid_list_norm):
+            sub = filtered[filtered["_pid_norm"] == pid_norm]
             if sub.empty:
                 continue
-            _add_series(pid, sub)
+            _add_series(pid_label, sub)
 
-    elif args.klass and not pid_list:
+    elif args.klass and not pid_list_norm:
         label = args.klass
         _add_series(label, filtered)
 
@@ -539,6 +756,26 @@ def main():
     if not HAS_RUPTURES:
         print("[NOTE] 'ruptures' not found; used equal-sized segments fallback.")
         print("       Install for optimal changepoints: pip install ruptures")
+
+    # NEW: write/append slopes CSV (single-PID only)
+    # NOTE:
+    #   - Plots always go to --outdir
+    #   - Slopes CSV is ALWAYS written to the default location (current working directory),
+    #     unless an explicit --slopes-csv path is provided.
+    if args.slopes_csv:
+        slopes_csv = Path(args.slopes_csv)
+    else:
+        slopes_csv = DEFAULT_SLOPES_DIR / f"{args.prefix}__regression_slopes.csv"
+
+    # NEW: series order in CSV should match the keypoint-hand lines you requested
+    # (e.g., L0, L4, R0, R4). This keeps each line under separate headers.
+    series_order = [f"{h}{k}" for (h, k) in series_specs]
+
+    if pid_to_series_slopes:
+        append_slopes_csv_single_pid_only_per_series(slopes_csv, pid_to_series_slopes, series_order, args.segments)
+        print(f"[OK] Appended regression slopes → {slopes_csv}")
+    else:
+        print("[NOTE] No single-PID series were plotted; slopes CSV not updated.")
 
 
 if __name__ == "__main__":
