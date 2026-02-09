@@ -19,7 +19,7 @@ SPARC-Project/
 │   ├── clustering.py
 │   ├── compute_movement.py
 │   ├── compute_touch_metrics.py
-│   ├── cumulative_hear.maps.py
+│   ├── cumulative_heatmaps.py
 │   ├── cumulative_heatmaps_fixseg.py
 │   ├── cumulative_movement_csv.py
 │   ├── cumulative_plot.py
@@ -29,7 +29,9 @@ SPARC-Project/
 │   ├── landmark_xyz.py
 │   ├── png2mp4.py
 │   ├── process_handmesh.py
-│   └── volume_lineplot.py
+│   ├── volume_lineplot.py
+│   ├── wrist_relative_transforms.py
+│   └── visualize_localframe.py
 ```
 
 * All analysis and processing logic resides in the `scripts/` directory.
@@ -97,7 +99,8 @@ A typical example structure for a single session may look like:
 │       ├── color/
 │       ├── depth/
 ```
-To get a good understanding of the required session-level folder structure refer to 'data-collection-pipeline' or 'sync-data-collection' branch.
+
+To get a good understanding of the required session-level folder structure refer to `data-collection-pipeline` or `sync-data-collection` branch.
 
 Key assumptions:
 
@@ -117,6 +120,9 @@ Key assumptions:
 
 * **`landmark_xyz.py`**
   Converts 2D hand landmark pixel coordinates into 3D coordinates using aligned depth data.
+
+* **`wrist_relative_transforms.py`**
+  Transforms 3D hand landmarks into a wrist-centered local coordinate frame using translation and rotation for frame-invariant analysis.
 
 * **`compute_movement.py`**
   Computes frame-to-frame movement and speed metrics at keypoint and part levels, with optional IQR-based outlier filtering.
@@ -141,6 +147,9 @@ Key assumptions:
 
 * **`volume_lineplot.py`**
   Plots ellipsoid volumes across temporal segments for comparative analysis.
+
+* **`visualize_localframe.py`**
+  Provides an interactive 3D Plotly-based visualization of hand movements in the wrist-centered local coordinate frame.
 
 * **`compute_touch_metrics.py`**
   Computes object-level interaction metrics such as first-touch timing and untouched duration.
