@@ -1,18 +1,19 @@
-
-# 🧠 SPARC Real-Time Unified Pipeline  
-**Multi-Camera • Hand Movement • Emotion • Object Interaction • Event Triggers**
+# 🧠 SPARC Real-Time Data Collection Pipeline  
+**Multi-Camera • Hand Movement • Emotion • Object Interaction • Event Triggers • Live Notes**
 
 ---
 
 ## 🌐 Overview
 
-The **SPARC Real-Time Unified Pipeline** provides synchronized **multi-camera RGB-D capture**, **hand & emotion analysis**, and **object interaction tracking** — all in **real time**.  
+The **SPARC Real-Time Data Collection Pipeline** provides synchronized **multi-camera RGB-D capture**, **hand & emotion analysis**, and **object interaction tracking** — all in **real time**.  
 It’s designed for **Human-Robot Interaction** and **Learning Behavior Studies** under the SPARC project.
 
 > 🎥 Captures from 1–4 Intel RealSense cameras  
 > 🖐️ Tracks hand movements (MediaPipe)  
 > 🙂 Maps facial emotions to valence–arousal space  
 > 🎯 Detects object interactions (HSV + ArUco)  
+> 🎙️ Records whitelisted microphones
+> 📝 Provides live Notes UI with synchronized timeline
 > ⚡ Triggers real-time speed and untouched events  
 > 🧩 Publishes triggers via ROS 2 Humble  
 
@@ -21,11 +22,11 @@ It’s designed for **Human-Robot Interaction** and **Learning Behavior Studies*
 ## 🗂️ Project Structure
 
 ```
-
 SPARC-Project/
 ├── realtime.sh                        # Interactive launcher
-├── camera_serials.txt                  # Known RealSense serials
-└── sync-data-collection/
+├── preview.sh                         # Standalone preview launcher
+├── requirements.txt                   # Python dependencies
+├── camera_serials.txt                 # Known RealSense serials
 └── scripts/
     ├── realtime_capture.py         # Main orchestrator
     ├── capture_worker.py           # Camera threads
@@ -38,14 +39,17 @@ SPARC-Project/
     ├── event_triggers.py           # Speed & untouched triggers
     ├── preview_grid.py             # Unified live preview grid
     ├── ros_publisher_node.py       # ROS 2 trigger publisher
+    ├── preview_all_cams.py        # Standalone RealSense RGB/Depth grid viewer
+    ├── notes_ui.py                # Qt-based Preview + Notes panel UI
+    ├── audio_worker.py            # ALSA-based microphone recording worker
+    ├── mic_config.py              # Whitelisted microphone device IDs
     ├── projection.py               # RGB→Depth projection utilities
     ├── hand_utils.py               # MediaPipe Hands helpers
     ├── logger_utils.py             # Debounced logging utilities
     ├── control_flags.py            # Shared pause/stop events
     ├── tunables.py                 # Centralized constants & parameters
     └── types_shared.py             # Shared data structures
-
-````
+```
 
 
 ## 🧩 Environment Setup
@@ -54,22 +58,21 @@ SPARC-Project/
 # Clone repository
 git clone https://github.com/safi-harshil/SPARC-Project.git
 cd SPARC-Project
-git checkout sync-data-collection
+git checkout realtime-data-collection
 
 # Create conda environment
-conda create -n realtime_v2 python=3.10.12 -y
+conda create -n realtime_v2 python=3.10 -y
 conda activate realtime_v2
 
 # Install dependencies
-pip install numpy opencv-python mediapipe \
-            pyrealsense2 matplotlib tqdm pandas sounddevice soundfile \
-            scikit-learn scipy
+pip install -r requirements.txt
 ````
 
-Make launcher executable:
+Make launchers executable:
 
 ```bash
 chmod +x realtime.sh
+chmod +x preview.sh
 ```
 
 ---
@@ -87,7 +90,17 @@ cam4:241222074947
 
 The pipeline auto-detects connected cameras and maps them to `cam1`–`cam4`.
 
----
+—
+
+## 🚀 To check the Preview
+
+From the repo root:
+
+```bash
+./preview.sh
+```
+
+—
 
 ## 🚀 Running the Pipeline
 
@@ -159,14 +172,16 @@ run_YYYYMMDD_HHMMSS/
 
 ## 🧠 Internal Flow
 
-1. **Camera Discovery** → `camera_utils.py`
-2. **Parallel Capture Threads** → `capture_worker.py`
-3. **Movement Analysis** → `movement_processor.py` (MediaPipe Hands)
-4. **Emotion Mapping** → `emotion_processor.py` & `emotion_mapping.py`
-5. **Object Interaction Tracking** → `object_worker.py` & `object_interaction.py`
-6. **Event Triggers** → `event_triggers.py` (speed & untouched events)
-7. **Unified Preview Grid** → `preview_grid.py` (video + plots)
-8. **ROS 2 Publishing** → `ros_publisher_node.py` (optional)
+1. Camera discovery → `camera_utils.py`
+2. Parallel capture threads → `capture_worker.py`
+3. Movement analysis → `movement_processor.py`
+4. Emotion mapping → `emotion_processor.py`
+5. Object tracking → `object_worker.py`
+6. Audio recording → `audio_worker.py`
+7. Event triggers → `event_triggers.py`
+8. Live preview grid → `preview_grid.py`
+9. Notes UI overlay → `notes_ui.py`
+10. ROS 2 publishing → `ros_publisher_node.py`
 
 ---
 
