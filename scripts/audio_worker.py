@@ -3,9 +3,36 @@
 import time
 from pathlib import Path
 import subprocess
+from shutil import which  # ✅ minimal addition (needed to detect sox/ffmpeg)
 
-from tunables import VALID_MIC_IDS
+from tunables import VALID_MIC_IDS, MIC_CHANNELS
 from logger_utils import DebouncedLogger
+
+
+def _split_stereo_to_two_mono(wav_final: Path):
+    """
+    Split stereo WAV into two mono WAVs:
+      *_tx1.wav and *_tx2.wav
+    Tries sox first, then ffmpeg.
+    """
+    base = wav_final.with_suffix("")  # path without .wav
+    tx1 = Path(str(base) + "_tx1.wav")
+    tx2 = Path(str(base) + "_tx2.wav")
+
+    if which("sox"):
+        subprocess.run(["sox", str(wav_final), str(tx1), "remix", "1"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(["sox", str(wav_final), str(tx2), "remix", "2"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return
+
+    if which("ffmpeg"):
+        subprocess.run(["ffmpeg", "-y", "-i", str(wav_final), "-map_channel", "0.0.0", str(tx1)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        subprocess.run(["ffmpeg", "-y", "-i", str(wav_final), "-map_channel", "0.0.1", str(tx2)],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        return
+
 
 def audio_worker(device_str: str, out_dir: Path, duration_sec: float, rate: int, logger: DebouncedLogger | None = None):
     """
@@ -30,12 +57,22 @@ def audio_worker(device_str: str, out_dir: Path, duration_sec: float, rate: int,
         return
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    safe_name = device_str.replace(":", "").replace(",", "")
+
+    # ✅ Minimal fix: add milliseconds so multiple mics started in same second don't collide
+    ts = time.strftime("%Y%m%d_%H%M%S") + f"_{int((time.time()%1)*1000):03d}"
+
+    # ✅ Minimal fix: sanitize '=' as well (CARD=RX,DEV=0)
+    safe_name = device_str.replace(":", "").replace(",", "").replace("=", "")
+
     wav_tmp = out_dir / f"mic_{safe_name}_{ts}.part"
     wav_final = Path(str(wav_tmp).replace(".part", ".wav"))
 
-    cmd = ["arecord", "-D", device_str, "-f", "cd", "-c", "1", "-r", str(rate), "-t", "wav", str(wav_tmp)]
+    # ✅ Minimal update:
+    # - Default is still mono (1 channel)
+    # - For RODE Wireless GO II RX, MIC_CHANNELS maps this device to 2 channels
+    channels = int(MIC_CHANNELS.get(device_str, 1))
+
+    cmd = ["arecord", "-D", device_str, "-f", "cd", "-c", str(channels), "-r", str(rate), "-t", "wav", str(wav_tmp)]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _log_info(f"Audio started on {device_str} → {wav_tmp.name}")
@@ -58,6 +95,12 @@ def audio_worker(device_str: str, out_dir: Path, duration_sec: float, rate: int,
             wav_tmp.replace(wav_final)
             print(f"[✅] Audio saved: {wav_final}")  # keep one visible success line
             _log_info(f"Audio saved: {wav_final.name}")
+
+            # ✅ Minimal addition:
+            # If device is 2-channel (e.g., RODE Wireless GO II RX), split to two mono WAVs (TX1/TX2)
+            if channels == 2:
+                _split_stereo_to_two_mono(wav_final)
+
         else:
             _log_warn(f"audio({device_str}): no output file produced.")
     except Exception as e:

@@ -36,7 +36,18 @@ DEFAULT_CELL_H = 360
 VALID_MIC_IDS = [
     'hw:2,0',   # card index, device index
     'hw:3,0',
+
+    # RODE Wireless GO II Receiver (single USB device)
+    # NOTE: receiver provides 2-channel input (TX1 + TX2) on the SAME device
+    # Using CARD-based address keeps it stable even if card index changes.
+    'hw:CARD=RX,DEV=0',
 ]
+
+# (Optional) channel map per device for arecord (-c)
+# If a device is not listed here, audio_worker defaults to 1 channel.
+MIC_CHANNELS = {
+    'hw:CARD=RX,DEV=0': 2,   # RODE GO II RX → 2 channels (TX1 + TX2)
+}
 
 # ================== Event trigger tunables (NEW) =======================================
 # Throttle logs/overlays to once per this many seconds (per slot)

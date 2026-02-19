@@ -2,8 +2,8 @@
 # realtime.sh — Interactive wrapper for realtime_capture.py (movement + emotion + object trigger)
 # Simplified: only main run arguments are interactive; rest under advanced controls.
 
-source /opt/ros/humble/setup.bash
-export ROS_DOMAIN_ID=0
+# source /opt/ros/humble/setup.bash
+# export ROS_DOMAIN_ID=0
 
 set -euo pipefail
 

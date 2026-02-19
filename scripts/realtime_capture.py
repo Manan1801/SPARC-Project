@@ -29,9 +29,9 @@ from emotion_processor import emotion_worker
 from object_worker import object_worker  # ✅ NEW
 from camera_utils import load_serial_map
 from audio_worker import audio_worker
-import rclpy
+# import rclpy
 
-from ros_publisher_node import ROS2PublisherNode
+# from ros_publisher_node import ROS2PublisherNode
 
 
 # shared control flags
@@ -155,17 +155,17 @@ def build_argparser():
 
 def main():
 
-    # Initialize rclpy once, get singleton node
-    node = ROS2PublisherNode.get_instance()
+    # # Initialize rclpy once, get singleton node
+    # node = ROS2PublisherNode.get_instance()
 
-    # Run ROS2 event loop in a background thread (so rest of code runs)
-    spin_thread = threading.Thread(
-        target=rclpy.spin,
-        args=(node,),
-        daemon=True,
-        name="ros2-spin-thread"
-    )
-    spin_thread.start()
+    # # Run ROS2 event loop in a background thread (so rest of code runs)
+    # spin_thread = threading.Thread(
+    #     target=rclpy.spin,
+    #     args=(node,),
+    #     daemon=True,
+    #     name="ros2-spin-thread"
+    # )
+    # spin_thread.start()
 
     try:
 
@@ -357,11 +357,29 @@ def main():
                         continue
             return found
 
+        # ✅ Minimal addition:
+        # Some devices (like RODE Wireless GO II RX) are better addressed by CARD=... style.
+        # arecord -l won’t list them in that exact string form, so we also scan arecord -L.
+        def _list_alsa_named_devices():
+            try:
+                out = subprocess.check_output(["arecord", "-L"], stderr=subprocess.STDOUT, text=True)
+            except Exception:
+                return []
+            found = []
+            for line in out.splitlines():
+                line = line.strip()
+                # Keep only hw:CARD=...,DEV=... style entries
+                if line.startswith("hw:CARD=") and ",DEV=" in line:
+                    found.append(line)
+            return found
+
         audio_threads = []
         aud_dir = Path(args.audio_out) if args.audio_out else (out_dir / "audio")
         if args.audio_duration_sec > 0:
             present = set(_list_alsa_hw_devices())
-            enabled = [d for d in VALID_MIC_IDS if d in present]
+            present_named = set(_list_alsa_named_devices())
+
+            enabled = [d for d in VALID_MIC_IDS if (d in present) or (d in present_named)]
             if not enabled:
                 print("[INFO] 🎙 No whitelisted mics detected; skipping audio.")
             else:
@@ -440,15 +458,15 @@ def main():
     except KeyboardInterrupt:
         print("\n[⛔] KeyboardInterrupt → stopping…", flush=True)
 
-    finally:
-        # --- Shutdown ROS2 node gracefully ---
-        print("[🧹] Shutting down ROS2...")
-        ROS2PublisherNode.shutdown()
-        try:
-            spin_thread.join(timeout=1.0)
-        except Exception:
-            pass
-        print("[✅] ROS2 shutdown complete.")
+    # finally:
+    #     # --- Shutdown ROS2 node gracefully ---
+    #     print("[🧹] Shutting down ROS2...")
+    #     ROS2PublisherNode.shutdown()
+    #     try:
+    #         spin_thread.join(timeout=1.0)
+    #     except Exception:
+    #         pass
+    #     print("[✅] ROS2 shutdown complete.")
 
 
 if __name__ == "__main__":

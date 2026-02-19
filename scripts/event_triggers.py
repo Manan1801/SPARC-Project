@@ -16,7 +16,7 @@ from typing import Optional, Tuple, List, Dict
 import random
 import json
 
-from ros_publisher_node import ROS2PublisherNode
+# from ros_publisher_node import ROS2PublisherNode
 
 from tunables import (
     SPEED_TRIGGER_CADENCE_WINDOW_S,
@@ -299,8 +299,8 @@ class RightWristSpeedTrigger(BaseTrigger):
                 kind="speed",
             )
 
-        node = ROS2PublisherNode.get_instance()
-        node.handspeed_piece_data = reason
+        # node = ROS2PublisherNode.get_instance()
+        # node.handspeed_piece_data = reason
 
         return {
             "good": good,
@@ -442,9 +442,9 @@ class ObjectUntouchedTrigger(BaseTrigger):
         except Exception:
             pass
 
-        label1 = json.dumps(object_list_ros)   # "{object} : {True|False}"
-        node = ROS2PublisherNode.get_instance()
-        node.untouched_piece_data = label1
+        # label1 = json.dumps(object_list_ros)   # "{object} : {True|False}"
+        # node = ROS2PublisherNode.get_instance()
+        # node.untouched_piece_data = label1
 
         # Return payload (kept for compatibility)
         return {
