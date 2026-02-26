@@ -1,4 +1,4 @@
-# SPARC-Project — LAK Branch
+# SPARC-Project — Analysis Core Branch
 
 ## 1. Project Overview
 
