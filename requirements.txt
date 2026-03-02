@@ -5,3 +5,4 @@ matplotlib==3.10.7
 sounddevice==0.5.1
 pyrealsense2==2.55.1.6486
 mediapipe==0.10.21
+PySide6==6.10.1
