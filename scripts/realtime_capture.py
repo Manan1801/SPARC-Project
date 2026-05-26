@@ -29,6 +29,8 @@ from emotion_processor import emotion_worker
 from object_worker import object_worker  # ✅ NEW
 from camera_utils import load_serial_map
 from audio_worker import audio_worker
+from eye_tracking import eye_tracking_worker  # ✅ NEW
+import certifi
 # import rclpy
 
 # from ros_publisher_node import ROS2PublisherNode
@@ -126,6 +128,16 @@ def build_argparser():
     ap.add_argument("--emo-history", type=int, default=240, help="Frames kept in on-screen VA plot (per cam)")
     ap.add_argument("--emo-stride", type=int, default=1, help="Process every Nth frame for emotion")
     ap.add_argument("--emo-csv-flush", type=int, default=30, help="CSV flush interval (frames) for emotion")
+    
+
+    #eye tracking
+    ap.add_argument("--eye-stride", type=int, default=1, help="Process every Nth frame for eye tracking")  # ✅ NEW
+    ap.add_argument("--eye-csv-flush", type=int, default=30, help="CSV flush interval (frames) for eye tracking")  # ✅ NEW
+    ap.add_argument(
+    "--process-eye-cams",
+    nargs="*",
+    help="Labels to process for eye tracking."
+)
 
     # camera selection
     ap.add_argument("--process-mov-cams", nargs="*", help="Labels to process for hand movement.")
@@ -192,10 +204,12 @@ def main():
         process_set_mov = set([lab.strip() for lab in (args.process_mov_cams or []) if lab.strip()])
         process_set_emo = set([lab.strip() for lab in (args.process_emo_cams or []) if lab.strip()])
         process_set_obj = set([lab.strip() for lab in (args.process_obj_cams or []) if lab.strip()])
+        process_set_eye = set([lab.strip() for lab in (args.process_eye_cams or []) if lab.strip()])  # ✅ NEW
 
         print(f"[INFO] Movement cams: {sorted(process_set_mov) if process_set_mov else 'NONE'}")
         print(f"[INFO] Emotion cams:  {sorted(process_set_emo) if process_set_emo else 'NONE'}")
         print(f"[INFO] Object-trigger cams: {sorted(process_set_obj) if process_set_obj else 'NONE'}")
+        print(f"[INFO] Eye-tracking cams: {sorted(process_set_eye) if process_set_eye else 'NONE'}") #Eye tracking
 
         # Speed trigger
         if not args.no_event_checker and process_set_mov:
@@ -266,12 +280,15 @@ def main():
         queues_mov: Dict[str, queue.Queue] = {}
         queues_emo: Dict[str, queue.Queue] = {}
         queues_obj: Dict[str, queue.Queue] = {}  # ✅ NEW
-        obj_threads = []  # ✅ NEW
+        queues_eye: Dict[str, queue.Queue] = {}  # for eye tracking 
+
+        obj_threads = []   # <-- ADD THIS
 
         for serial, label in active:
             q_mov = None
             q_emo = None
             q_obj = None  # ✅ NEW
+            q_eye = None  # for eye tracking 
 
             # Movement
             if label in process_set_mov:
@@ -312,6 +329,18 @@ def main():
                 t_proc_emo.start()
                 proc_threads.append(t_proc_emo)
 
+            #EYE Tracking
+            if label in process_set_eye:
+                q_eye = queue.Queue(maxsize=8)
+                queues_eye[label] = q_eye
+                t_proc_eye = threading.Thread(
+                    target=eye_tracking_worker,
+                    args=(label, q_eye, out_dir),
+                    daemon=True, name=f"proc-eye-{label}"
+                )
+                t_proc_eye.start()
+                proc_threads.append(t_proc_eye)
+
             # Object interaction trigger lane
             if label in process_set_obj:
                 q_obj = queue.Queue(maxsize=8)
@@ -327,16 +356,40 @@ def main():
                 obj_threads.append(t_proc_obj)
 
             # Capture
+            # t_cap = threading.Thread(
+            #     target=capture_worker,
+            #     args=(serial, label, out_dir, float(args.duration_sec), max(0, args.save_every),
+            #         (args.filters == "on"), queues_mov.get(label, None),
+            #         queues_emo.get(label, None), args.backpressure,
+            #         queues_obj.get(label, None)),  # ✅ NEW
+            #         queues_eye.get(label, None),  # for eye tracking (optional, not yet implemented in capture_worker) --- IGNORE for now
+            #     daemon=True, name=f"cap-{label}"
+            # )
+            # t_cap.start()
+            # cap_threads.append(t_cap)
+
+            # Capture
             t_cap = threading.Thread(
                 target=capture_worker,
-                args=(serial, label, out_dir, float(args.duration_sec), max(0, args.save_every),
-                    (args.filters == "on"), queues_mov.get(label, None),
-                    queues_emo.get(label, None), args.backpressure,
-                    queues_obj.get(label, None)),  # ✅ NEW
-                daemon=True, name=f"cap-{label}"
+                args=(
+                    serial,
+                    label,
+                    out_dir,
+                    float(args.duration_sec),
+                    max(0, args.save_every),
+                    (args.filters == "on"),
+                    queues_mov.get(label, None),
+                    queues_emo.get(label, None),
+                    args.backpressure,
+                    queues_obj.get(label, None),
+                    queues_eye.get(label, None),   # ✅ eye queue
+                ),
+                daemon=True,
+                name=f"cap-{label}"
             )
+
             t_cap.start()
-            cap_threads.append(t_cap)
+            cap_threads.append(t_cap) #thread list for capture threads (one per cam)
 
         # --- Audio ---
         def _list_alsa_hw_devices():
@@ -415,7 +468,7 @@ def main():
         except Exception as e:
             log_exception(preview_logger, "Error while joining capture threads", e)
         finally:
-            for q in list(queues_mov.values()) + list(queues_emo.values()) + list(queues_obj.values()):
+            for q in list(queues_mov.values()) + list(queues_emo.values()) + list(queues_obj.values()) + list(queues_eye.values()):
                 setattr(q, "closed", True)
 
             for t in proc_threads + obj_threads:

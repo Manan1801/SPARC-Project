@@ -88,6 +88,12 @@ echo "  - Enter 'none' to disable"
 PROC_EMO_INPUT="$(ask "Emotion cams" "cam1")"
 
 echo
+echo "Which camera(s) to PROCESS for EYE TRACKING?"
+echo "  - Comma-separated labels (e.g., cam1)"
+echo "  - Enter 'none' to disable"
+PROC_EYE_INPUT="$(ask "Eye tracking cams" "cam1")"
+
+echo
 echo "Which camera(s) to PROCESS for OBJECT TRIGGERS?"
 echo "  - Comma-separated labels (e.g., cam2 or cam1,cam3)"
 echo "  - Enter 'none' to disable"
@@ -156,6 +162,12 @@ CMD+=("--stride" "$STRIDE" "--backpressure" "$BKP_POLICY" "--viz-save-every" "$V
 CMD+=("--csv-flush" "$CSV_FLUSH" "--log-flush-sec" "$LOG_FLUSH_SEC")
 CMD+=("--emo-history" "$EMO_HISTORY" "--emo-stride" "$EMO_STRIDE" "--emo-csv-flush" "$EMO_CSV_FLUSH")
 
+# Eye tracking cams
+IFS=',' read -r -a EYE_ARR <<<"${PROC_EYE_INPUT// /}"
+if [[ "${PROC_EYE_INPUT,,}" != "none" && "${PROC_EYE_INPUT,,}" != "" ]]; then
+  CMD+=("--process-eye-cams" "${EYE_ARR[@]}")
+fi
+
 # Notes toggle  ← NEW
 if [[ "${NOTES_ENABLE,,}" == "y" ]]; then
   CMD+=("--notes" "on")
@@ -209,6 +221,7 @@ echo "Notes UI          : $([[ "${NOTES_ENABLE,,}" == "y" ]] && echo "ENABLED" |
 echo "Movement cams     : $PROC_MOV_INPUT"
 echo "Emotion cams      : $PROC_EMO_INPUT"
 echo "Object cams       : $PROC_OBJ_INPUT"
+echo "Eye tracking cams : $PROC_EYE_INPUT"
 echo "Speed-trigger     : $([[ "${EVENT_CHECKER_ENABLE,,}" == "y" ]] && echo "ENABLED" || echo "DISABLED")"
 echo "Object-trigger    : $([[ "${OBJ_TRIGGER_ENABLE,,}" == "y" ]] && echo "ENABLED" || echo "DISABLED")"
 if [[ "$ADVANCED" == "y" ]]; then

@@ -25,6 +25,8 @@ def _flush_all():
             except Exception:
                 pass
 
+
+
 atexit.register(_flush_all)
 
 # ───────────────────────── Debounced Logger ──────────────────────────
@@ -126,6 +128,25 @@ def get_speed_trigger_logger(cam_dir: Path, *, flush_sec: int = 5, debug: bool =
 # NEW: per-cam object-untouched trigger logger (no extension per spec)
 def get_object_trigger_logger(cam_dir: Path, *, flush_sec: int = 5, debug: bool = False, tee: bool = False) -> DebouncedLogger:
     return _mk_logger(Path(cam_dir) / "logs" / "object_trigger", flush_sec, debug, tee)
+
+
+# keep: per-cam speed-trigger logger
+def get_speed_trigger_logger(cam_dir: Path, *, flush_sec: int = 5,
+                             debug: bool = False, tee: bool = False) -> DebouncedLogger:
+    return _mk_logger(Path(cam_dir) / "logs" / "speed_trigger.txt",
+                      flush_sec, debug, tee)
+
+# NEW: eye tracking logger
+def get_eye_logger(cam_dir: Path, *, flush_sec: int = 5,
+                   debug: bool = False, tee: bool = False) -> DebouncedLogger:
+    return _mk_logger(Path(cam_dir) / "logs" / "eye_tracking_rt.log",
+                      flush_sec, debug, tee)
+
+# NEW: per-cam object-untouched trigger logger
+def get_object_trigger_logger(cam_dir: Path, *, flush_sec: int = 5,
+                              debug: bool = False, tee: bool = False) -> DebouncedLogger:
+    return _mk_logger(Path(cam_dir) / "logs" / "object_trigger",
+                      flush_sec, debug, tee)
 
 # ───────────────────────── Convenience helpers ───────────────────────
 def log_exception(logger: DebouncedLogger, prefix: str, exc: BaseException):

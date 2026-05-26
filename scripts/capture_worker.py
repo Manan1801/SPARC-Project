@@ -59,7 +59,8 @@ def capture_worker(
     q_mov: Optional["pyqueue.Queue[FramePacket]"],
     q_emo: Optional["pyqueue.Queue[FramePacket]"],
     backpressure: str,
-    q_obj: Optional["pyqueue.Queue[FramePacket]"] = None,  # ✅ NEW (optional)
+    q_obj: Optional["pyqueue.Queue[FramePacket]"] = None,
+    q_eye: Optional["pyqueue.Queue[FramePacket]"] = None,  # ✅ NEW (optional)
 ):
     """
     Captures color+depth from a RealSense, aligns depth to color, optionally filters,
@@ -266,6 +267,7 @@ def capture_worker(
             _safe_put(q_mov, pkt, backpressure)
             _safe_put(q_emo, pkt, backpressure)
             _safe_put(q_obj, pkt, backpressure)  # ✅ NEW: feed object lane
+            _safe_put(q_eye, pkt, backpressure)  # ✅ NEW: feed eye lane
 
             frame_id += 1
 
