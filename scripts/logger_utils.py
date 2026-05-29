@@ -139,8 +139,12 @@ def get_speed_trigger_logger(cam_dir: Path, *, flush_sec: int = 5,
 # NEW: eye tracking logger
 def get_eye_logger(cam_dir: Path, *, flush_sec: int = 5,
                    debug: bool = False, tee: bool = False) -> DebouncedLogger:
-    return _mk_logger(Path(cam_dir) / "logs" / "eye_tracking_rt.log",
-                      flush_sec, debug, tee)
+    return _mk_logger(
+        Path(cam_dir) / "logs" / "eye_tracking_rt.log",
+        flush_sec,
+        debug,
+        tee
+    )
 
 # NEW: per-cam object-untouched trigger logger
 def get_object_trigger_logger(cam_dir: Path, *, flush_sec: int = 5,

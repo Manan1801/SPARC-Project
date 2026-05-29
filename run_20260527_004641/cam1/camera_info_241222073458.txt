@@ -12,7 +12,7 @@ Product Line: D400
   laser_power: 150.0
   emitter_enabled: 1.0
   frames_queue_size: 16.0
-  asic_temperature: 26.0
+  asic_temperature: 25.0
   error_polling_enabled: 1.0
   projector_temperature: 26.0
   output_trigger_enabled: 0.0

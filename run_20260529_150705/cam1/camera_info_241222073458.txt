@@ -1,7 +1,7 @@
-Camera Label: cam3
-Serial Number: 250122074372
-Firmware Version: 5.17.0.10
-USB Port ID: /sys/devices/pci0000:00/0000:00:14.0/usb2/2-1/2-1:1.0/video4linux/video0
+Camera Label: cam1
+Serial Number: 241222073458
+Firmware Version: 5.16.0.1
+USB Port ID: /sys/devices/pci0000:00/0000:00:14.0/usb2/2-2/2-2:1.0/video4linux/video6
 Product Line: D400
 
 [Sensor: Stereo Module]
@@ -17,7 +17,8 @@ Product Line: D400
   projector_temperature: 26.0
   output_trigger_enabled: 0.0
   depth_units: 0.0010000000474974513
-  stereo_baseline: 49.981964111328125
+  stereo_baseline: 49.998512268066406
+  inter_cam_sync_mode: 0.0
   emitter_on_off: 0.0
   global_time_enabled: 1.0
   emitter_always_on: 0.0
