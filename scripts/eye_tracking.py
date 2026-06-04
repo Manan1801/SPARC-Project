@@ -144,6 +144,22 @@ def eye_tracking_worker(cam_label, q_eye, out_dir):
 
             face_landmarks = results.multi_face_landmarks[0]
 
+            NOSE_TIP = 1
+
+            nose = face_landmarks.landmark[NOSE_TIP]
+
+            nose_x = int(nose.x * w)
+            nose_y = int(nose.y * h)
+
+            face_center_x = w // 2
+            face_center_y = h // 2
+
+            head_yaw = (nose_x - face_center_x) / face_center_x
+            head_pitch = (nose_y - face_center_y) / face_center_y
+
+            head_yaw = np.clip(head_yaw, -1.0, 1.0)
+            head_pitch = np.clip(head_pitch, -1.0, 1.0)
+
             # LEFT EYE
             left_eye_left = face_landmarks.landmark[LEFT_EYE_LEFT]
             left_eye_right = face_landmarks.landmark[LEFT_EYE_RIGHT]
@@ -174,6 +190,7 @@ def eye_tracking_worker(cam_label, q_eye, out_dir):
 
             rx, ry = right_center
 
+    
             # Combined eye center
             eye_x = int((lx + rx) / 2)
             eye_y = int((ly + ry) / 2)
@@ -290,29 +307,65 @@ def eye_tracking_worker(cam_label, q_eye, out_dir):
             head_horizontal = "CENTER"
             head_vertical = "CENTER"
 
-            if smooth_X < -0.08:
+            if head_yaw < -0.15:
                 head_horizontal = "LEFT"
-            elif smooth_X > 0.08:
+            elif head_yaw > 0.15:
                 head_horizontal = "RIGHT"
 
-            if smooth_Y < -0.05:
+            if head_pitch < -0.10:
                 head_vertical = "UP"
-            elif smooth_Y > 0.05:
+            elif head_pitch > 0.10:
                 head_vertical = "DOWN"
-
             # Gaze
+            # gaze_horizontal = "CENTER"
+            # gaze_vertical = "CENTER"
+
+            # if horizontal_ratio < 0.35:
+            #     gaze_horizontal = "LEFT"
+            # elif horizontal_ratio > 0.65:
+            #     gaze_horizontal = "RIGHT"
+
+            # if vertical_ratio < 0.30:
+            #     gaze_vertical = "UP"
+            # elif vertical_ratio > 0.70:
+            #     gaze_vertical = "DOWN"
+
+            # ==========================================================
+            # IMPROVED GAZE ESTIMATION
+            # ==========================================================
+
+            eye_gaze_x = (horizontal_ratio - 0.5) * 2.0
+            eye_gaze_y = (vertical_ratio - 0.5) * 2.0
+
+            # combine eye movement + head movement
+
+            gaze_x = eye_gaze_x + 0.5 * head_yaw
+            gaze_y = eye_gaze_y + 0.5 * head_pitch
+
+            gaze_x = np.clip(gaze_x, -1.0, 1.0)
+            gaze_y = np.clip(gaze_y, -1.0, 1.0)
+
+            gaze_dx = int(gaze_x * 170)
+            gaze_dy = int(gaze_y * 170)
+
             gaze_horizontal = "CENTER"
             gaze_vertical = "CENTER"
 
-            if horizontal_ratio < 0.35:
+            if gaze_x < -0.35:
                 gaze_horizontal = "LEFT"
-            elif horizontal_ratio > 0.65:
+
+            elif gaze_x > 0.35:
                 gaze_horizontal = "RIGHT"
 
-            if vertical_ratio < 0.30:
+            if gaze_y < -0.25:
                 gaze_vertical = "UP"
-            elif vertical_ratio > 0.70:
+
+            elif gaze_y > 0.25:
                 gaze_vertical = "DOWN"
+
+            # Yaw and pitch in degrees
+            eye_yaw_deg = gaze_x * 35.0
+            eye_pitch_deg = -gaze_y * 25.0
 
             tracking_confidence = min(
                 1.0,
@@ -342,7 +395,16 @@ def eye_tracking_worker(cam_label, q_eye, out_dir):
                     ly,
 
                     rx,
-                    ry
+                    ry,
+
+                    gaze_dx,
+                    gaze_dy,
+
+                    head_yaw,
+                    head_pitch,
+
+                    eye_yaw_deg,
+                    eye_pitch_deg
                 )
 
             except Exception as e:
