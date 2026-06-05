@@ -56,3 +56,6 @@ output/
 runs/
 recordings/
 logs/
+
+#ignore the models directory if it contains large pre-trained models or checkpoints
+models/
