@@ -91,10 +91,6 @@ class L2CSGazeEstimator:
             input_img = frame_bgr
 
         try:
-            print(type(input_img))
-            print(input_img.dtype)
-            print(input_img.shape)
-            print(input_img.flags["C_CONTIGUOUS"])
             results = self.pipeline.step(input_img)
 
         except Exception:
