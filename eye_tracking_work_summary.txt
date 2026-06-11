@@ -1,0 +1,127 @@
+Eye Tracking Work Summary
+=========================
+
+Date: 2026-06-12
+Repository: SPARC-Project
+
+Purpose
+-------
+Create a concise, single-file summary describing the recent changes made to the eye tracking pipeline and HUD, the methods used, files edited, diagnostics performed, and recommended next steps (git/CI). This file is intended to help you understand what was done and reproduce/extend it.
+
+What we changed (high level)
+----------------------------
+- Fixed a sign-convention bug in the gaze-angle conversion so the blue gaze vector points correctly.
+- Reverted to the correct pipeline for converting L2CS-Net face-space angles into camera-space gaze vectors by rotating with the head pose matrix (from PnP). This preserves head-relative gaze semantics.
+- Polished the HUD overlay design (three-panel dashboard: top banner, left readout, right analytics) and added helper drawing utilities.
+- Removed an accidental long blue connecting line from the analytics grid (a cosmetic overlay).
+- Restored the RGB pose axis lines (X red, Y green, Z blue) drawn from the nose tip — these are useful pose visualizations and were accidentally removed and then restored.
+
+Files edited
+------------
+- `scripts/eye_tracking.py`
+  - Restored correct pose-axis drawing on the nose tip (RGB axes via `cv2.line` + `cv2.projectPoints`).
+  - This file contains the main processing loop: PnP head pose, iris center detection, depth backprojection, L2CS-Net gaze inference, angle smoothing, and CSV/image output.
+
+- `scripts/eye_tracking_ui.py`
+  - Improved HUD layout and styling: top banner (HEAD/EYE/GAZE), left readout panel, right analytics panel.
+  - Removed the long blue gaze arrow overlay (it was drawing a long arrow across the scene). The red gaze arrow and face-related vectors were left intact.
+  - Added/updated helper functions: panel, ruled_panel, T (text), axis_widget, gaze_indicator_icon, sparkline and grid drawing functions.
+
+Key methods and libraries used
+-----------------------------
+- MediaPipe FaceMesh: 468 facial landmarks (with iris points) for robust 2D landmark detection.
+- OpenCV:
+  - `cv2.solvePnPRansac` / `cv2.projectPoints` for 6-point head pose estimation and drawing the RGB axes.
+  - `cv2.line`, `cv2.arrowedLine`, `cv2.circle`, and overlay compositing for HUD rendering.
+  - `cv2.RQDecomp3x3` used to get Euler angles for display (head yaw/pitch roll).
+- L2CS-Net (ResNet50) gaze model: accepts a face crop and outputs yaw/pitch angles in face-space (convention: +yaw=right, +pitch=down). We use the angles and convert them to a 3D face-space unit vector.
+- 3D math and coordinate conventions:
+  - Camera coordinates: x=right (+), y=down (+), z=forward (+ away from camera).
+  - L2CS face-space vector creation: `gx = -sin(yaw)*cos(pitch)`, `gy = -sin(pitch)`, `gz = cos(yaw)*cos(pitch)` (or equivalent used in code).
+  - Rotation from face-space to camera-space performed using the rotation matrix obtained from `cv2.Rodrigues(rvec)` (head pose R).
+  - Convert camera-space vector to display yaw/pitch with proper sign conventions: `yaw = atan2(-gx, gz)`, `pitch = asin(-gy)`.
+
+Pipeline (detailed)
+-------------------
+1. Capture RGB (and depth) frame from camera.
+2. Run MediaPipe FaceMesh to get face landmarks (including iris points).
+3. Use 6 selected facial landmarks with `solvePnPRansac` to estimate head pose (rvec, tvec) and derive rotation matrix `R`.
+4. Compute iris center pixels (average iris landmarks) and read depth for back-projection.
+5. Generate face crop for L2CS-Net and estimate raw face-space yaw/pitch.
+6. Convert L2CS yaw/pitch to a 3D face-space unit vector.
+7. Rotate that face-space vector by the head pose rotation `R` to obtain a camera-space gaze vector.
+8. Convert camera-space vector to display angles and optionally a 2D screen projection for HUD drawing.
+9. Apply smoothing (EMA) to depth/angles/positions for stable display.
+10. Write CSV row and save annotated image frames periodically.
+
+Why the blue vector and signs matter
+-----------------------------------
+- Angle sign convention errors (flipping a sign) change the displayed gaze direction. The correct camera conversion is `yaw = atan2(-gx, gz)` and `pitch = asin(-gy)`.
+- We ensure the vector rotation step is done (face-space -> rotate by head pose -> camera-space) so the gaze accounts for head orientation.
+
+Cosmetic/UI changes made
+------------------------
+- Redesigned HUD panels for a professional dashboard look: top banner with 3 zones, left readout panel for numeric values, right analytics panel with grid and sparkline charts.
+- Kept minimal face overlays: iris rings, central combined eye marker, red gaze arrow (shorter) and restored RGB pose axes on the nose tip.
+- Removed the long blue arrow crossing the scene (cosmetic, not part of the final gaze pipeline). This is the element you asked removed.
+
+Commands and checks I ran locally
+---------------------------------
+- Python compile checks to ensure no syntax errors:
+  - `python3 -m py_compile scripts/eye_tracking.py scripts/eye_tracking_ui.py`
+- Git inspection commands to verify the pushed commit and branch:
+  - `git rev-parse --abbrev-ref HEAD`
+  - `git rev-parse HEAD`
+  - `git status --porcelain`
+  - `git log -n 5 --oneline`
+  - `git remote -v`
+  - `git fetch origin --quiet`
+  - `git ls-remote origin <HEAD_HASH>`
+
+Git/GitHub notes (contributions and green checks)
+-------------------------------------------------
+- Your commit is present on the remote `origin` in branch `realtime-data-collection`.
+- GitHub contribution graph (green squares) and checks behave as follows:
+  - Contribution counts (green squares) normally only appear for commits on the repository default branch (usually `main`) or when a branch's commits are merged into the default branch.
+  - CI/Checks (green check icons next to commits/PRs) only appear if you have CI configured (GitHub Actions workflows) or external checks attached.
+- Suggested actions:
+  - Create a Pull Request from `realtime-data-collection` -> `main` and merge it to count as a contribution and show merged commit.
+  - Or merge from terminal (commands provided below). If you prefer a linear history, rebase onto `main` first.
+
+Safe merge commands (run locally if ready)
+----------------------------------------
+1) Ensure a clean working tree:
+   git status
+   # If dirty: `git add -A && git commit -m "WIP: save before merge"` or `git stash`
+
+2) Merge sequence (safe):
+   git checkout main
+   git fetch origin
+   git pull origin main
+   git merge realtime-data-collection
+   # resolve conflicts if any
+   git push origin main
+
+Alternative: open a Pull Request on GitHub and merge via the web UI.
+
+Next recommended steps
+----------------------
+1. If you want CI checks for this repo, I can add a minimal GitHub Actions workflow (for lint/tests) so pushes/PRs show checks.
+2. Decide whether to merge now (terminal) or via PR. PR is recommended for review and safety.
+3. If you'd like, I can also prepare and push a minimal `.github/workflows/python-ci.yml` that runs on PR and push events.
+
+Who to contact / credentials
+----------------------------
+- The commit author on the latest commit is `Manan1801 <mananchavda18@gmail.com>` and your local git config matches that email.
+- Because the commit email is associated to your GitHub account, merging will count toward your contributions.
+
+Where this file is
+------------------
+This summary is saved as `eye_tracking_work_summary.txt` at the repository root.
+
+If you want changes
+-------------------
+- Tell me to expand any section (more math detail, code pointers, or example values).
+- If you want the PR created and merged automatically, or a CI file added, I can implement those next.
+
+End of summary.
